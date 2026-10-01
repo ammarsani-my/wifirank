@@ -1,0 +1,137 @@
+#!/usr/bin/env python3
+"""Scan nearby Wi-Fi networks, sorted strongest-first.
+
+Uses a small GUI helper app that holds Location Services permission, because
+macOS hides network names from plain command-line tools. Falls back to
+system_profiler (names redacted) if the helper is missing.
+"""
+import json, os, re, subprocess, sys
+
+HELPER = os.path.expanduser(
+    "~/.local/libexec/WiFiScanHelper.app/Contents/MacOS/wifiscanhelper")
+
+
+def via_helper():
+    p = subprocess.run([HELPER], capture_output=True, text=True, timeout=120)
+    rows = json.loads(p.stdout or "[]")
+    if not rows:
+        sys.stderr.write(p.stderr)
+    return [dict(ssid=r["ssid"], sig=r["rssi"], bssid=r["bssid"],
+                 snr=r["rssi"] - r["noise"] if r["noise"] else None,
+                 ch=str(r["channel"]), band=r["band"], sec=r["security"],
+                 cur=r["current"]) for r in rows]
+
+
+def via_profiler():
+    raw = subprocess.run(["system_profiler", "-json", "SPAirPortDataType"],
+                         capture_output=True, text=True).stdout
+    ifaces = json.loads(raw)["SPAirPortDataType"][0]["spairport_airport_interfaces"]
+    out = []
+    for iface in ifaces:
+        nets = [(iface.get("spairport_current_network_information"), True)]
+        nets += [(n, False) for n in
+                 iface.get("spairport_airport_other_local_wireless_networks", [])]
+        for net, cur in nets:
+            if not net or not net.get("spairport_signal_noise"):
+                continue
+            sig, noise = (re.findall(r"(-?\d+) dBm", net["spairport_signal_noise"]) + [None])[:2]
+            ch = net.get("spairport_network_channel", "")
+            # Apple ships one value with a typo ("pairport_..."), so strip loosely.
+            sec = re.sub(r"^s?pairport_security_mode_", "", net.get("spairport_security_mode", ""))
+            out.append(dict(
+                ssid=net.get("_name", "?"), sig=int(sig), bssid="",
+                snr=int(sig) - int(noise) if noise else None,
+                ch=ch.split(" ")[0],
+                band="5G" if "5GHz" in ch else "6G" if "6GHz" in ch else "2.4G" if "2GHz" in ch else "?",
+                sec={"none": "open", "": "?"}.get(sec, sec.replace("_", " ")), cur=cur))
+    return out
+
+
+show_bssid = "--bssid" in sys.argv
+try:
+    nets = via_helper() if os.access(HELPER, os.X_OK) else via_profiler()
+except Exception as e:
+    sys.exit(f"Scan failed: {e}")
+
+if not nets:
+    sys.exit("No networks found. Is Wi-Fi on?")
+
+
+def family(ssid):
+    """Network name with any band marker removed, so Foo and Foo_5G match."""
+    s = re.sub(r"[-_ ]?(2\.4|2|5|6)\s*ghz?\b", "", ssid.lower())
+    return re.sub(r"[-_ ]+", "_", s).strip("_")
+
+
+def best_first(r):
+    """Highest SNR first; stronger signal breaks ties. Same order as WiFi Rank."""
+    return (-(r["snr"] if r["snr"] is not None else -999), -r["sig"])
+
+
+def render(rows, indent=""):
+    for n in rows:
+        bar = "▂▄▆█"[min(3, max(0, (n["sig"] + 90) // 12))]
+        snr = n["snr"] if n["snr"] is not None else "-"
+        col = f"{n['bssid']:<18}" if show_bssid else ""
+        print(f"{'*' if n['cur'] else ' '} {indent}{n['ssid'][:28 - len(indent)]:<{28 - len(indent)}} "
+              f"{snr:>4} {n['sig']:>5} {n['ch']:>4} {n['band']:<5} {bar} {col}{n['sec']}")
+
+
+head = f"{'BSSID':<18}" if show_bssid else ""
+print(f"  {'SSID':<28} {'SNR':>4} {'dBm':>5} {'CH':>4} {'BAND':<5}   {head}SECURITY")
+
+if not show_bssid:
+    # Plain view: one line per network name, strongest transmitter wins.
+    best = {}
+    for n in sorted(nets, key=lambda r: -r["sig"]):
+        best.setdefault(n["ssid"], n)
+    render(sorted(best.values(), key=best_first))
+else:
+    # Group the radios that live in one router. They share the first five
+    # bytes of their hardware address; a matching name catches the rest.
+    parent = {}
+
+    def find(x):
+        while parent.setdefault(x, x) != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    by_family = {}
+    for n in nets:
+        n["_base"] = n["bssid"][:14] or n["ssid"]
+        find(n["_base"])
+        fam = family(n["ssid"])
+        if n["ssid"] != "(hidden)" and fam:
+            by_family.setdefault(fam, []).append(n["_base"])
+    for bases in by_family.values():
+        for b in bases[1:]:
+            union(bases[0], b)
+
+    groups = {}
+    for n in nets:
+        groups.setdefault(find(n["_base"]), []).append(n)
+    for g in groups.values():
+        g.sort(key=best_first)
+    ordered = sorted(groups.values(), key=lambda g: best_first(g[0]))
+
+    prev_grouped = False
+    for g in ordered:
+        grouped = len(g) > 1
+        if grouped or prev_grouped:
+            print()
+        if grouped:
+            label = min((n["ssid"] for n in g if n["ssid"] != "(hidden)"),
+                        key=len, default=g[0]["ssid"])
+            print(f"  \u250c {label}  \u00b7  {len(g)} radios  \u00b7  {g[0]['bssid'][:14]}xx")
+            render(g, indent="  ")
+        else:
+            render(g)
+        prev_grouped = grouped
+
+print("\n* = connected. Best pick: highest SNR, then strongest dBm.")
