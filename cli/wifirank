@@ -1,21 +1,20 @@
 #!/usr/bin/env python3
-"""Scan nearby Wi-Fi networks, sorted strongest-first.
+"""Scan nearby Wi-Fi networks, best first.
 
-Uses a small GUI helper app that holds Location Services permission, because
-macOS hides network names from plain command-line tools. Falls back to
-system_profiler (names redacted) if the helper is missing.
+Asks the WiFi Rank app to do the scan (`--json`), because macOS hides network
+names from plain command-line tools and the app holds the location permission.
+Falls back to system_profiler (names redacted) if the app isn't installed.
 """
 import json, os, re, subprocess, sys
 
-HELPER = os.path.expanduser(
-    "~/.local/libexec/WiFiScanHelper.app/Contents/MacOS/wifiscanhelper")
+APP = next((a for a in (os.path.expanduser("~/Applications/WiFi Rank.app/Contents/MacOS/wifirank"),
+                        "/Applications/WiFi Rank.app/Contents/MacOS/wifirank") if os.access(a, os.X_OK)), None)
 
 
-def via_helper():
-    p = subprocess.run([HELPER], capture_output=True, text=True, timeout=120)
+def via_app():
+    # stderr is left attached so messages such as "click Allow" reach the terminal.
+    p = subprocess.run([APP, "--json"], stdout=subprocess.PIPE, text=True, timeout=120)
     rows = json.loads(p.stdout or "[]")
-    if not rows:
-        sys.stderr.write(p.stderr)
     return [dict(ssid=r["ssid"], sig=r["rssi"], bssid=r["bssid"],
                  snr=r["rssi"] - r["noise"] if r["noise"] else None,
                  ch=str(r["channel"]), band=r["band"], sec=r["security"],
@@ -49,7 +48,7 @@ def via_profiler():
 
 show_bssid = "--bssid" in sys.argv
 try:
-    nets = via_helper() if os.access(HELPER, os.X_OK) else via_profiler()
+    nets = via_app() if APP else via_profiler()
 except Exception as e:
     sys.exit(f"Scan failed: {e}")
 
@@ -59,13 +58,28 @@ if not nets:
 
 def family(ssid):
     """Network name with any band marker removed, so Foo and Foo_5G match."""
-    s = re.sub(r"[-_ ]?(2\.4|2|5|6)\s*ghz?\b", "", ssid.lower())
+    s = re.sub(BAND, "", ssid.lower())
     return re.sub(r"[-_ ]+", "_", s).strip("_")
 
 
 def best_first(r):
     """Highest SNR first; stronger signal breaks ties. Same order as WiFi Rank."""
     return (-(r["snr"] if r["snr"] is not None else -999), -r["sig"])
+
+
+BAND = r"[-_ ]?(2\.4|2|5|6)\s*g(hz)?\b"
+
+
+def same_box(x, y):
+    """Radios in one box share the 4th and 5th address bytes and have last bytes
+    close together (…:b2/…:b3). Separate boxes jump further (…:ac/…:75)."""
+    bx, by = x.split(":"), y.split(":")
+    return len(bx) == len(by) == 6 and bx[3:5] == by[3:5] and abs(int(bx[5], 16) - int(by[5], 16)) <= 16
+
+
+def base_name(ssid):
+    """Network name with any band marker removed, keeping its capitals."""
+    return re.sub(BAND, "", ssid, flags=re.I).strip(" _-") or ssid
 
 
 def render(rows, indent=""):
@@ -87,8 +101,9 @@ if not show_bssid:
         best.setdefault(n["ssid"], n)
     render(sorted(best.values(), key=best_first))
 else:
-    # Group the radios that live in one router. They share the first five
-    # bytes of their hardware address; a matching name catches the rest.
+    # Group the radios that live in one router: the same first five address
+    # bytes, the same box (see same_box), or the same name once band markers
+    # are removed. Any one clue is enough.
     parent = {}
 
     def find(x):
@@ -112,10 +127,33 @@ else:
     for bases in by_family.values():
         for b in bases[1:]:
             union(bases[0], b)
+    with_addr = [n for n in nets if n["bssid"]]
+    for i, x in enumerate(with_addr):
+        for y in with_addr[i + 1:]:
+            if same_box(x["bssid"], y["bssid"]):
+                union(x["_base"], y["_base"])
 
     groups = {}
     for n in nets:
         groups.setdefault(find(n["_base"]), []).append(n)
+
+    # Physical boxes, for the "N access points" count: address rule only, since
+    # one name can be broadcast by several boxes.
+    box_parent = {}
+
+    def box_find(x):
+        while box_parent.setdefault(x, x) != x:
+            x = box_parent[x]
+        return x
+
+    addrs = sorted({n["bssid"] for n in nets if len(n["bssid"]) == 17})
+    for i, x in enumerate(addrs):
+        for y in addrs[i + 1:]:
+            if same_box(x, y):
+                ra, rb = box_find(x), box_find(y)
+                if ra != rb:
+                    box_parent[ra] = rb
+    box_of = {x: box_find(x) for x in addrs}
     for g in groups.values():
         g.sort(key=best_first)
     ordered = sorted(groups.values(), key=lambda g: best_first(g[0]))
@@ -126,9 +164,17 @@ else:
         if grouped or prev_grouped:
             print()
         if grouped:
-            label = min((n["ssid"] for n in g if n["ssid"] != "(hidden)"),
-                        key=len, default=g[0]["ssid"])
-            print(f"  \u250c {label}  \u00b7  {len(g)} radios  \u00b7  {g[0]['bssid'][:14]}xx")
+            names = sorted({n["ssid"] for n in g if n["ssid"] != "(hidden)"}, key=str.lower)
+            boxes = len({box_of[n["bssid"]] for n in g if n["bssid"] in box_of})
+            if len({family(x) for x in names}) > 1:
+                names = sorted({base_name(x) for x in names}, key=str.lower)
+                shown = ", ".join(names[:3]) + (f" +{len(names) - 3} more" if len(names) > 3 else "")
+                label = f"{shown}  \u00b7  {len(names)} names"
+            else:
+                label = base_name(min(names, key=len)) if names else g[0]["ssid"]
+            where = f"{boxes} access points" if boxes > 1 else "1 access point"
+            radios = len({n["bssid"] for n in g if n["bssid"]}) or len(g)
+            print(f"  \u250c {label}  \u00b7  {where}  \u00b7  {radios} radio{'s' if radios != 1 else ''}")
             render(g, indent="  ")
         else:
             render(g)

@@ -1,50 +1,198 @@
-// Menu bar list of nearby Wi-Fi networks, strongest first.
-// The scan itself is done by WiFiScanHelper.app, which holds the location
-// permission macOS requires before it will reveal network names.
+// WiFi Rank: nearby Wi-Fi networks ranked best first, in the menu bar, in a
+// window, and (through `--json`) for the `wifirank` terminal command.
 import AppKit
+import CoreLocation
+import CoreWLAN
 import ServiceManagement
 
-let helperPath = NSString(string: "~/.local/libexec/WiFiScanHelper.app/Contents/MacOS/wifiscanhelper").expandingTildeInPath
-
 struct Net {
-    let ssid: String, rssi: Int, noise: Int, channel: Int, band: String, security: String
+    let ssid: String, bssid: String, rssi: Int, noise: Int, channel: Int, band: String, security: String
     var current: Bool
     var saved = false
+    /// Share of the channel's airtime already in use, as the router reports it (not all do).
+    var busyPercent: Int? = nil
+    /// Devices connected, as the router reports it.
+    var devices: Int? = nil
+    /// Other access points heard on the same channel.
+    var sameChannel = 0
     var snr: Int? { noise == 0 ? nil : rssi - noise }
 }
 
-func scan() -> (nets: [Net], error: String?) {
-    let p = Process()
-    p.executableURL = URL(fileURLWithPath: helperPath)
-    let out = Pipe(), err = Pipe()
-    p.standardOutput = out
-    p.standardError = err
-    do { try p.run() } catch { return ([], "Scan helper not found.") }
-    let data = out.fileHandleForReading.readDataToEndOfFile()
-    let errText = String(data: err.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-    p.waitUntilExit()
-    guard let rows = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]], !rows.isEmpty else {
-        return ([], errText.isEmpty ? "No networks found. Is Wi-Fi on?" : errText.trimmingCharacters(in: .whitespacesAndNewlines))
+/// How usable a signal is, from its SNR (the same thresholds the README explains).
+func snrLevel(_ snr: Int) -> (word: String, color: NSColor) {
+    switch snr {
+    case 25...: return ("Good: enough for full speed", .systemGreen)
+    case 10...: return ("Fair: works, but may slow down", .systemOrange)
+    default: return ("Poor: will struggle", .systemRed)
     }
-    // One entry per name: keep the strongest transmitter.
+}
+
+/// The SNR hover: the signal and noise behind the number, and why a weak one is weak.
+func snrExplanation(_ n: Net) -> String? {
+    guard let snr = n.snr else { return "Signal \(n.rssi) dBm; this network didn't report its noise level." }
+    var s = "\(snrLevel(snr).word). Signal \(n.rssi) dBm, noise \(n.noise) dBm."
+    if snr < 25 {
+        s += n.rssi >= -67
+            ? " Strong signal but a noisy channel: interference, not distance. Its 5G version or another network may do better."
+            : " Weak signal: distance is the problem. A closer access point would help."
+    }
+    return s
+}
+
+/// Only risky security gets a colour; normal encryption stays neutral.
+func securityWarning(_ security: String) -> (word: String, color: NSColor)? {
+    switch security {
+    case "open": return ("No password and no encryption: others nearby can see unencrypted traffic.", .systemOrange)
+    case "wep": return ("WEP encryption is broken and easy to crack.", .systemRed)
+    default: return nil
+    }
+}
+
+/// How crowded a channel is, from the share of airtime in use (a common rule of thumb).
+func busyLevel(_ percent: Int) -> (word: String, color: NSColor) {
+    switch percent {
+    case ..<30: return ("Comfortable", .systemGreen)
+    case ..<60: return ("Getting crowded", .systemOrange)
+    default: return ("Crowded", .systemRed)
+    }
+}
+
+/// Reads the "BSS Load" element (id 11) from a beacon: devices connected and channel use.
+func bssLoad(_ ie: Data?) -> (devices: Int, busy: Int)? {
+    guard let ie else { return nil }
+    let b = [UInt8](ie)
+    var i = 0
+    while i + 2 <= b.count {
+        let id = b[i], len = Int(b[i + 1])
+        if id == 11, len >= 5, i + 2 + len <= b.count {
+            return (Int(b[i + 2]) | Int(b[i + 3]) << 8, Int((Double(b[i + 4]) / 255 * 100).rounded()))
+        }
+        i += 2 + len
+    }
+    return nil
+}
+
+func err(_ s: String) { FileHandle.standardError.write((s + "\n").data(using: .utf8)!) }
+
+/// macOS shows real network names only to an app with Location Services permission,
+/// so every scan waits for this first.
+final class Location: NSObject, CLLocationManagerDelegate {
+    static let shared = Location()
+    private let manager = CLLocationManager()
+    private var waiting: [(Bool) -> Void] = []
+    private var heard = false   // macOS reports the real status shortly after start-up
+    private var asked = false
+
+    override init() {
+        super.init()
+        manager.delegate = self
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+            guard let self, !self.heard else { return }
+            self.heard = true
+            self.settle()
+        }
+    }
+
+    /// Calls `done(true)` once access is granted, asking first only if macOS has never asked.
+    func whenAuthorized(_ done: @escaping (Bool) -> Void) {
+        waiting.append(done)
+        if heard { settle() }
+    }
+
+    func locationManagerDidChangeAuthorization(_ m: CLLocationManager) {
+        heard = true
+        settle()
+    }
+
+    private func settle() {
+        guard !waiting.isEmpty else { return }
+        switch manager.authorizationStatus {
+        case .notDetermined:
+            if !asked {
+                asked = true
+                err("WiFi Rank is asking for location access — click Allow.")
+                manager.requestWhenInUseAuthorization()
+            }
+        case .denied, .restricted:
+            finish(false)
+        default:
+            finish(true)
+        }
+    }
+
+    private func finish(_ ok: Bool) {
+        let calls = waiting
+        waiting = []
+        calls.forEach { $0(ok) }
+    }
+}
+
+let locationOffMessage = "Location access is off for WiFi Rank, so network names are hidden. "
+    + "Turn it on in System Settings → Privacy & Security → Location Services."
+
+func band(_ n: CWNetwork) -> String {
+    switch n.wlanChannel?.channelBand {
+    case .band2GHz: return "2.4G"
+    case .band5GHz: return "5G"
+    case .band6GHz: return "6G"
+    default: return "?"
+    }
+}
+
+/// Approximate: CoreWLAN reports most mixed networks as WPA3 transition.
+func security(_ n: CWNetwork) -> String {
+    if n.supportsSecurity(.none) { return "open" }
+    if n.supportsSecurity(.wpa3Personal) { return "wpa3" }
+    if n.supportsSecurity(.wpa3Transition) { return "wpa3 transition" }
+    if n.supportsSecurity(.wpa3Enterprise) { return "wpa3 enterprise" }
+    if n.supportsSecurity(.wpa2Personal) { return "wpa2" }
+    if n.supportsSecurity(.wpa2Enterprise) { return "wpa2 enterprise" }
+    if n.supportsSecurity(.personal) { return "wpa" }
+    if n.supportsSecurity(.WEP) { return "wep" }
+    return "other"
+}
+
+/// Every access point in range, unranked: hidden networks and duplicates included.
+/// Blocks for a few seconds, so call it off the main thread.
+func scanAll() -> (nets: [Net], error: String?) {
+    guard let iface = CWWiFiClient.shared().interface() else { return ([], "No Wi-Fi hardware found.") }
+    let found: Set<CWNetwork>
+    do { found = try iface.scanForNetworks(withSSID: nil) }
+    catch { return ([], "Scan failed: \(error.localizedDescription)") }
+    if found.isEmpty { return ([], "No networks found. Is Wi-Fi on?") }
+    let current = iface.ssid()
+    let known = savedNetworks()
+    let nets = found.map { n -> Net in
+        let ssid = n.ssid ?? "(hidden)"
+        var net = Net(ssid: ssid, bssid: n.bssid ?? "", rssi: n.rssiValue, noise: n.noiseMeasurement,
+                      channel: n.wlanChannel?.channelNumber ?? 0, band: band(n), security: security(n),
+                      current: n.ssid != nil && n.ssid == current)
+        net.saved = known.contains(ssid)
+        if let load = bssLoad(n.informationElementData) {
+            net.devices = load.devices
+            net.busyPercent = load.busy
+        }
+        let ch = n.wlanChannel?.channelNumber
+        net.sameChannel = found.filter { $0.wlanChannel?.channelNumber == ch }.count - 1
+        return net
+    }
+    return (nets, nil)
+}
+
+/// One row per network name (its strongest transmitter), hidden networks dropped,
+/// best first: highest SNR, then stronger signal.
+func ranked(_ all: [Net]) -> [Net] {
     var best: [String: Net] = [:]
-    for r in rows {
-        let n = Net(ssid: r["ssid"] as? String ?? "?", rssi: r["rssi"] as? Int ?? -999,
-                    noise: r["noise"] as? Int ?? 0, channel: r["channel"] as? Int ?? 0,
-                    band: r["band"] as? String ?? "?", security: r["security"] as? String ?? "",
-                    current: r["current"] as? Bool ?? false)
-        if n.ssid == "(hidden)" { continue }
-        if var e = best[n.ssid] {
-            e.current = e.current || n.current
-            best[n.ssid] = n.rssi > e.rssi ? Net(ssid: n.ssid, rssi: n.rssi, noise: n.noise, channel: n.channel,
-                                                  band: n.band, security: n.security, current: e.current) : e
+    for n in all where n.ssid != "(hidden)" {
+        if let e = best[n.ssid] {
+            var keep = n.rssi > e.rssi ? n : e
+            keep.current = e.current || n.current
+            best[n.ssid] = keep
         } else {
             best[n.ssid] = n
         }
     }
-    let known = savedNetworks()
-    let nets = best.values.map { n -> Net in var n = n; n.saved = known.contains(n.ssid); return n }
-    return (nets.sorted { ($0.snr ?? -999, $0.rssi) > ($1.snr ?? -999, $1.rssi) }, nil)
+    return best.values.sorted { ($0.snr ?? -999, $0.rssi) > ($1.snr ?? -999, $1.rssi) }
 }
 
 func run(_ args: [String]) -> String {
@@ -290,32 +438,42 @@ final class NetworksWindow: NSObject, NSTableViewDataSource, NSTableViewDelegate
     let table = NSTableView()
     let status = NSTextField(labelWithString: "")
     let rescanButton: NSButton
+    let tabs = NSSegmentedControl(labels: ["Networks", "Speed"], trackingMode: .selectOne, target: nil, action: nil)
+    let networksView = NSView()
+    let speedTab: SpeedTab
     var nets: [Net] = []
     var rows: [Row] = []
 
     // id, title, width, default sort (nil = not sortable), header tooltip
     static let columns: [(String, String, CGFloat, NSSortDescriptor?, String)] = [
         ("icon", "", 44, nil, ""),
-        ("name", "Network", 170, NSSortDescriptor(key: "name", ascending: true),
+        ("name", "Network", 210, NSSortDescriptor(key: "name", ascending: true),
          "The network's name. A tick means you're connected to it."),
         ("band", "Band", 50, NSSortDescriptor(key: "band", ascending: true),
          "2.4G reaches further but is slower and more crowded. 5G is faster but weaker through walls."),
         ("snr", "SNR", 44, NSSortDescriptor(key: "snr", ascending: false),
-         "How far the signal stands out above background noise. The best guide to real speed: above 25 is comfortable, under 10 will struggle."),
-        ("rssi", "Signal", 72, NSSortDescriptor(key: "rssi", ascending: false),
-         "Raw signal strength. Closer to zero is stronger: -50 excellent, -65 good, -75 weak, -85 barely usable."),
+         "How far the signal stands out above background noise. The best guide to real speed: green 25 and above is good, "
+            + "orange 10–24 works but may slow, red under 10 will struggle. Hover a value to see the signal and noise behind it."),
         ("channel", "Channel", 62, NSSortDescriptor(key: "channel", ascending: true),
          "Which lane in the band the network uses. Networks on the same channel slow each other down."),
-        ("security", "Security", 110, nil,
-         "The encryption the network offers (approximate). Open means no password and no encryption."),
+        ("busy", "Busy", 54, NSSortDescriptor(key: "busy", ascending: true),
+         "How much of the channel's airtime is already in use, as the router reports it. Lower is better: "
+            + "green under 30% is comfortable, orange 30–59% is getting crowded, red 60% and over is crowded. "
+            + "Not every router reports it; hover a value for details."),
+        ("security", "Security", 88, nil,
+         "The encryption the network offers (approximate). Orange Open means no password and no encryption; "
+            + "red WEP is easy to crack."),
     ]
 
     var onClose: () -> Void = {}
 
-    init(onRescan: @escaping () -> Void) {
+    enum Tab: Int { case networks, speed }
+
+    init(onRescan: @escaping () -> Void, currentNet: @escaping () -> Net?) {
         self.onRescan = onRescan
-        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 700, height: 440),
-                          styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
+        speedTab = SpeedTab(currentNet: currentNet)
+        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 700, height: 480),
+                          styleMask: [.titled, .closable], backing: .buffered, defer: false)
         rescanButton = NSButton(title: "Rescan", image: NSImage(systemSymbolName: "arrow.clockwise", accessibilityDescription: nil)!,
                                 target: nil, action: nil)
         super.init()
@@ -325,8 +483,12 @@ final class NetworksWindow: NSObject, NSTableViewDataSource, NSTableViewDelegate
         window.standardWindowButton(.zoomButton)?.isHidden = true
         window.collectionBehavior.insert(.fullScreenNone)
         window.isReleasedWhenClosed = false
-        window.minSize = NSSize(width: 520, height: 260)
-        if !window.setFrameUsingName("WiFiRankNetworks") { window.center() }
+        // Fixed size; only the position is remembered between openings.
+        if window.setFrameUsingName("WiFiRankNetworks") {
+            window.setContentSize(NSSize(width: 700, height: 480))
+        } else {
+            window.center()
+        }
         window.setFrameAutosaveName("WiFiRankNetworks")
 
         for (id, title, width, sort, tip) in Self.columns {
@@ -336,7 +498,7 @@ final class NetworksWindow: NSObject, NSTableViewDataSource, NSTableViewDelegate
             let headerFont = NSFont.boldSystemFont(ofSize: c.headerCell.font?.pointSize ?? NSFont.smallSystemFontSize)
             let fit = sort == nil ? 0 : ceil((title as NSString).size(withAttributes: [.font: headerFont]).width) + 34
             c.width = max(width, fit)
-            c.minWidth = id == "name" ? 120 : c.width
+            c.minWidth = id == "name" ? 110 : c.width
             c.resizingMask = id == "name" ? .autoresizingMask : []
             c.headerCell.alignment = id == "name" ? .left : .center
             c.sortDescriptorPrototype = sort
@@ -347,7 +509,7 @@ final class NetworksWindow: NSObject, NSTableViewDataSource, NSTableViewDelegate
         table.delegate = self
         table.style = .fullWidth
         table.rowHeight = 24
-        table.intercellSpacing = NSSize(width: 10, height: 0)
+        table.intercellSpacing = NSSize(width: 6, height: 0)
         table.usesAlternatingRowBackgroundColors = true
         table.selectionHighlightStyle = .none
         table.allowsColumnReordering = false
@@ -367,32 +529,64 @@ final class NetworksWindow: NSObject, NSTableViewDataSource, NSTableViewDelegate
         rescanButton.action = #selector(rescan)
         rescanButton.keyEquivalent = "r"
         rescanButton.keyEquivalentModifierMask = .command
-        let hint = NSTextField(labelWithString: "Best pick: highest SNR. Hover a column title to see what it means; click one to sort.")
+        // A long status trims with "…" rather than widening the window.
+        status.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        tabs.selectedSegment = Tab.networks.rawValue
+        tabs.target = self
+        tabs.action = #selector(tabChanged)
+        let hint = NSTextField(labelWithString: "Best pick: green SNR and green Busy. Hover a value or column title to see what it means; click a title to sort.")
         hint.font = .systemFont(ofSize: 11)
         hint.textColor = .secondaryLabelColor
         hint.lineBreakMode = .byTruncatingTail
 
         let content = BackgroundView()
         window.contentView = content
-        for v in [status, rescanButton, scroll, hint] as [NSView] {
+        for v in [tabs, networksView, speedTab] as [NSView] {
             v.translatesAutoresizingMaskIntoConstraints = false
             content.addSubview(v)
         }
+        for v in [status, rescanButton, scroll, hint] as [NSView] {
+            v.translatesAutoresizingMaskIntoConstraints = false
+            networksView.addSubview(v)
+        }
+        let n = networksView
         NSLayoutConstraint.activate([
-            rescanButton.topAnchor.constraint(equalTo: content.topAnchor, constant: 12),
-            rescanButton.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -16),
-            status.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 16),
+            tabs.topAnchor.constraint(equalTo: content.topAnchor, constant: 12),
+            tabs.centerXAnchor.constraint(equalTo: content.centerXAnchor),
+            n.topAnchor.constraint(equalTo: tabs.bottomAnchor, constant: 6),
+            n.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            n.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            n.bottomAnchor.constraint(equalTo: content.bottomAnchor),
+            speedTab.topAnchor.constraint(equalTo: n.topAnchor),
+            speedTab.leadingAnchor.constraint(equalTo: n.leadingAnchor),
+            speedTab.trailingAnchor.constraint(equalTo: n.trailingAnchor),
+            speedTab.bottomAnchor.constraint(equalTo: n.bottomAnchor),
+
+            rescanButton.topAnchor.constraint(equalTo: n.topAnchor, constant: 8),
+            rescanButton.trailingAnchor.constraint(equalTo: n.trailingAnchor, constant: -16),
+            status.leadingAnchor.constraint(equalTo: n.leadingAnchor, constant: 16),
             status.centerYAnchor.constraint(equalTo: rescanButton.centerYAnchor),
             status.trailingAnchor.constraint(lessThanOrEqualTo: rescanButton.leadingAnchor, constant: -12),
-            scroll.topAnchor.constraint(equalTo: rescanButton.bottomAnchor, constant: 12),
-            scroll.leadingAnchor.constraint(equalTo: content.leadingAnchor),
-            scroll.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            scroll.topAnchor.constraint(equalTo: rescanButton.bottomAnchor, constant: 10),
+            scroll.leadingAnchor.constraint(equalTo: n.leadingAnchor),
+            scroll.trailingAnchor.constraint(equalTo: n.trailingAnchor),
             hint.topAnchor.constraint(equalTo: scroll.bottomAnchor, constant: 8),
-            hint.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 16),
-            hint.trailingAnchor.constraint(lessThanOrEqualTo: content.trailingAnchor, constant: -16),
-            hint.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -10),
+            hint.leadingAnchor.constraint(equalTo: n.leadingAnchor, constant: 16),
+            hint.trailingAnchor.constraint(lessThanOrEqualTo: n.trailingAnchor, constant: -16),
+            hint.bottomAnchor.constraint(equalTo: n.bottomAnchor, constant: -10),
         ])
+        select(.networks)
     }
+
+    var selectedTab: Tab { Tab(rawValue: tabs.selectedSegment) ?? .networks }
+
+    func select(_ tab: Tab) {
+        tabs.selectedSegment = tab.rawValue
+        networksView.isHidden = tab != .networks
+        speedTab.isHidden = tab != .speed
+    }
+
+    @objc func tabChanged() { select(selectedTab) }
 
     let onRescan: () -> Void
     @objc func rescan() { onRescan() }
@@ -407,6 +601,7 @@ final class NetworksWindow: NSObject, NSTableViewDataSource, NSTableViewDelegate
         rescanButton.isEnabled = !scanning
         self.nets = nets
         rebuildRows()
+        if !scanning { speedTab.panel.refresh() }
     }
 
     func less(_ a: Net, _ b: Net, _ key: String) -> Bool {
@@ -415,6 +610,7 @@ final class NetworksWindow: NSObject, NSTableViewDataSource, NSTableViewDelegate
         case "band": return a.band < b.band
         case "snr": return (a.snr ?? -999, a.rssi) < (b.snr ?? -999, b.rssi)
         case "channel": return a.channel < b.channel
+        case "busy": return (a.busyPercent ?? 999) < (b.busyPercent ?? 999)
         default: return a.rssi < b.rssi
         }
     }
@@ -423,7 +619,11 @@ final class NetworksWindow: NSObject, NSTableViewDataSource, NSTableViewDelegate
     func rebuildRows() {
         let sd = table.sortDescriptors.first
         let key = sd?.key ?? "snr", asc = sd?.ascending ?? false
-        let order: (Net, Net) -> Bool = { asc ? self.less($0, $1, key) : self.less($1, $0, key) }
+        let order: (Net, Net) -> Bool = { a, b in
+            // Routers that don't report how busy they are go last, whichever way it's sorted.
+            if key == "busy", (a.busyPercent == nil) != (b.busyPercent == nil) { return b.busyPercent == nil }
+            return asc ? self.less(a, b, key) : self.less(b, a, key)
+        }
         rows = []
         let known = nets.filter { $0.saved }.sorted(by: order)
         let others = nets.filter { !$0.saved }.sorted(by: order)
@@ -452,10 +652,26 @@ final class NetworksWindow: NSObject, NSTableViewDataSource, NSTableViewDelegate
             case "icon": return signalCell(n)
             case "name": return label(n.ssid, font: font, color: .labelColor, align: .left)
             case "band": return label(n.band, font: digits, color: .secondaryLabelColor, align: .center)
-            case "snr": return label(n.snr.map(String.init) ?? "–", font: digits, color: .secondaryLabelColor, align: .center)
+            case "snr":
+                let level = n.snr.map(snrLevel)
+                let cell = label(n.snr.map(String.init) ?? "–", font: digits, color: level?.color ?? .secondaryLabelColor, align: .center)
+                cell.toolTip = snrExplanation(n)
+                return cell
             case "rssi": return label("\(n.rssi) dBm", font: digits, color: .secondaryLabelColor, align: .center)
             case "channel": return label(String(n.channel), font: digits, color: .secondaryLabelColor, align: .center)
-            case "security": return label(prettySecurity(n.security), font: font, color: .secondaryLabelColor, align: .center)
+            case "busy":
+                let level = n.busyPercent.map(busyLevel)
+                let cell = label(n.busyPercent.map { "\($0)%" } ?? "–", font: digits,
+                                 color: level?.color ?? .secondaryLabelColor, align: .center)
+                let others = n.sameChannel == 1 ? "1 other network" : "\(n.sameChannel) other networks"
+                cell.toolTip = n.busyPercent.map { "\(level!.word): channel \($0)% busy · \(n.devices ?? 0) devices connected · "
+                    + "\(others) on channel \(n.channel)" } ?? "This router doesn't report how busy it is. \(others) share channel \(n.channel)."
+                return cell
+            case "security":
+                let warning = securityWarning(n.security)
+                let cell = label(prettySecurity(n.security), font: font, color: warning?.color ?? .secondaryLabelColor, align: .center)
+                cell.toolTip = warning?.word
+                return cell
             default: return nil
             }
         }
@@ -541,7 +757,21 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var updated: Date?
     var detailed = false   // menu was opened with Option held
     var networksWindow: NetworksWindow?
+    var speedWindow: SpeedWindow?
     var launchedAtLogin = false
+    var backgroundScans: Timer?
+    /// How often to look for a better known network while the app runs.
+    static let backgroundScanEvery: TimeInterval = 300
+
+    var currentNet: Net? { nets.first { $0.current } }
+
+    /// True when the speed view is what the user is looking at, so no notification is needed.
+    var isWatchingSpeed: Bool {
+        guard NSApp.isActive else { return false }
+        if speedWindow?.window.isKeyWindow == true { return true }
+        guard let w = networksWindow, w.window.isKeyWindow else { return false }
+        return w.selectedTab == .speed
+    }
 
     func applicationWillFinishLaunching(_ note: Notification) {
         let ev = NSAppleEventManager.shared().currentAppleEvent
@@ -558,6 +788,32 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func toggleNetworksWindow() {
         if let w = networksWindow?.window, w.isVisible { w.performClose(nil) } else { showNetworksWindow() }
     }
+
+    /// In the Dock while any window is open; menu bar only otherwise.
+    func updateDockPresence() {
+        let open = [networksWindow?.window, speedWindow?.window].contains { $0?.isVisible == true }
+        NSApp.setActivationPolicy(open ? .regular : .accessory)
+    }
+
+    @objc func showSpeedTab() {
+        showNetworksWindow()
+        networksWindow?.select(.speed)
+    }
+
+    /// The small speed window starts a test straight away unless one is already running.
+    @objc func testSpeedNow() {
+        if speedWindow == nil {
+            speedWindow = SpeedWindow(currentNet: { [weak self] in self?.currentNet })
+            speedWindow?.onClose = { [weak self] in DispatchQueue.main.async { self?.updateDockPresence() } }
+        }
+        NSApp.setActivationPolicy(.regular)
+        NSApp.activate(ignoringOtherApps: true)
+        speedWindow?.window.makeKeyAndOrderFront(nil)
+        speedWindow?.panel.refresh()
+        SpeedController.shared.start(on: currentNet)
+    }
+
+    @objc func toggleBetterAlerts() { Notifier.shared.betterAlertsOn.toggle() }
 
     func applicationDidFinishLaunching(_ note: Notification) {
         NSApp.applicationIconImage = makeAppIcon()
@@ -576,16 +832,33 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         appItem.submenu = appSub
         mainMenu.addItem(appItem)
         NSApp.mainMenu = mainMenu
+
+        Notifier.shared.setUp()
+        Notifier.shared.onOpenSpeed = { [weak self] in self?.showSpeedTab() }
+        Notifier.shared.onOpenNetworks = { [weak self] in
+            self?.showNetworksWindow()
+            self?.networksWindow?.select(.networks)
+        }
+        SpeedController.shared.onFinished = { [weak self] sample in
+            Notifier.shared.speedFinished(sample, userIsWatching: self?.isWatchingSpeed ?? false)
+        }
+        // Quiet scans so a clearly better known network can be suggested.
+        let t = Timer(timeInterval: Self.backgroundScanEvery, repeats: true) { [weak self] _ in
+            if Notifier.shared.betterAlertsOn { self?.startScan() }
+        }
+        RunLoop.main.add(t, forMode: .common)
+        backgroundScans = t
         rebuild()
+        startScan()
         // Opened by hand (not at login): show the window straight away.
         if !launchedAtLogin { DispatchQueue.main.async { self.showNetworksWindow() } }
     }
 
     @objc func showNetworksWindow() {
         if networksWindow == nil {
-            networksWindow = NetworksWindow(onRescan: { [weak self] in self?.startScan() })
-            // Leave the Dock again once the window is closed.
-            networksWindow?.onClose = { NSApp.setActivationPolicy(.accessory) }
+            networksWindow = NetworksWindow(onRescan: { [weak self] in self?.startScan() },
+                                            currentNet: { [weak self] in self?.currentNet })
+            networksWindow?.onClose = { [weak self] in DispatchQueue.main.async { self?.updateDockPresence() } }
         }
         networksWindow?.update(nets: nets, error: error, scanning: scanning, updated: updated)
         NSApp.setActivationPolicy(.regular)
@@ -621,7 +894,20 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         show.image = NSImage(systemSymbolName: "macwindow", accessibilityDescription: nil)
         show.toolTip = "Shortcut: Shift-click the menu bar icon"
         m.addItem(show)
+        let speed = NSMenuItem(title: SpeedController.shared.isTesting ? "Testing Internet Speed…" : "Test Internet Speed…",
+                               action: #selector(testSpeedNow), keyEquivalent: "")
+        speed.target = self
+        speed.image = NSImage(systemSymbolName: "speedometer", accessibilityDescription: nil)
+        speed.toolTip = "Measures the internet speed of the network you're on. About 20 seconds; uses some data."
+        m.addItem(speed)
         m.addItem(.separator())
+        let alerts = NSMenuItem(title: "Better Network Alerts", action: #selector(toggleBetterAlerts), keyEquivalent: "")
+        alerts.target = self
+        alerts.state = Notifier.shared.betterAlertsOn ? .on : .off
+        alerts.image = NSImage(systemSymbolName: "bell", accessibilityDescription: nil)
+        alerts.toolTip = "Notifies you when one of your known networks is clearly better than the one you're on. "
+            + "Checks every 5 minutes; one alert at a time."
+        m.addItem(alerts)
         let login = NSMenuItem(title: "Start at Login", action: #selector(toggleLogin), keyEquivalent: "")
         login.target = self
         login.state = SMAppService.mainApp.status == .enabled ? .on : .off
@@ -644,14 +930,18 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard !scanning else { return }
         scanning = true
         rebuild()
-        DispatchQueue.global().async {
-            let r = scan()
-            DispatchQueue.main.async {
-                self.nets = r.nets
-                self.error = r.error
-                self.updated = Date()
-                self.scanning = false
-                self.rebuild()
+        Location.shared.whenAuthorized { ok in
+            DispatchQueue.global().async {
+                let r = scanAll()
+                DispatchQueue.main.async {
+                    self.nets = ranked(r.nets)
+                    self.error = ok ? r.error : locationOffMessage
+                    self.updated = Date()
+                    self.scanning = false
+                    self.rebuild()
+                    self.speedWindow?.panel.refresh()
+                    Notifier.shared.scanned(self.nets)
+                }
             }
         }
     }
@@ -669,97 +959,34 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 }
 
-// `wifirank --render out.png [--dark] [--detailed]` draws the menu to a picture
-// without showing anything on screen, for checking the layout.
-if let i = CommandLine.arguments.firstIndex(of: "--render"), i + 1 < CommandLine.arguments.count {
-    _ = NSApplication.shared
-    let r = scan()
-    let items = buildItems(nets: r.nets, error: r.error, scanning: false, updated: Date(),
-                           detailed: CommandLine.arguments.contains("--detailed"), app: nil)
-    let appearance = NSAppearance(named: CommandLine.arguments.contains("--dark") ? .darkAqua : .aqua)!
-    var y: CGFloat = 5
-    var placed: [(RowView, CGFloat)] = []
-    var seps: [CGFloat] = []
-    for it in items {
-        if it.isSeparatorItem { seps.append(y + 5); y += 11; continue }
-        guard let v = it.view as? RowView else { continue }
-        placed.append((v, y))
-        y += v.frame.height
-    }
-    let size = NSSize(width: placed.first?.0.frame.width ?? 300, height: y + 5)
-    // Show the hover state on the first row that can actually be clicked.
-    placed.map(\.0).first { $0.kind == .item && $0.interactive }?.forceHighlight = true
-    let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: Int(size.width * 2), pixelsHigh: Int(size.height * 2),
-                               bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
-                               colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)!
-    rep.size = size
-    NSGraphicsContext.saveGraphicsState()
-    // Rows are laid out top-down, so draw into a top-down (flipped) context.
-    let cg = NSGraphicsContext(bitmapImageRep: rep)!.cgContext
-    cg.translateBy(x: 0, y: size.height)
-    cg.scaleBy(x: 1, y: -1)
-    NSGraphicsContext.current = NSGraphicsContext(cgContext: cg, flipped: true)
-    appearance.performAsCurrentDrawingAppearance {
-        NSColor.windowBackgroundColor.setFill()
-        NSBezierPath(roundedRect: NSRect(origin: .zero, size: size), xRadius: 10, yRadius: 10).fill()
-        NSColor.separatorColor.setFill()
-        for sy in seps { NSRect(x: 12, y: sy, width: size.width - 24, height: 1).fill() }
-        for (v, vy) in placed {
-            NSGraphicsContext.saveGraphicsState()
-            let t = NSAffineTransform()
-            t.translateX(by: 0, yBy: vy)
-            t.concat()
-            v.appearance = appearance
-            v.draw(v.bounds)
-            NSGraphicsContext.restoreGraphicsState()
+/// Runs one scan inside a normal app run loop (macOS hides network names otherwise),
+/// hands the result to `body`, then exits. Used by every command-line mode.
+final class Headless: NSObject, NSApplicationDelegate {
+    let body: ([Net], String?) -> Void
+    init(_ body: @escaping ([Net], String?) -> Void) { self.body = body }
+
+    func applicationDidFinishLaunching(_ note: Notification) {
+        Location.shared.whenAuthorized { ok in
+            DispatchQueue.global().async {
+                let r = scanAll()
+                DispatchQueue.main.async {
+                    self.body(r.nets, ok ? r.error : locationOffMessage)
+                    exit(0)
+                }
+            }
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 90) {
+            err("Timed out waiting for location access.")
+            exit(2)
         }
     }
-    NSGraphicsContext.restoreGraphicsState()
-    try! rep.representation(using: .png, properties: [:])!.write(to: URL(fileURLWithPath: CommandLine.arguments[i + 1]))
-    exit(0)
 }
 
-// `wifirank --render-icon out.png` draws the app icon.
-if let i = CommandLine.arguments.firstIndex(of: "--render-icon"), i + 1 < CommandLine.arguments.count {
-    _ = NSApplication.shared
-    let icon = makeAppIcon()
-    let rep = NSBitmapImageRep(data: icon.tiffRepresentation!)!
-    try! rep.representation(using: .png, properties: [:])!.write(to: URL(fileURLWithPath: CommandLine.arguments[i + 1]))
+func runHeadless(_ body: @escaping ([Net], String?) -> Void) -> Never {
+    let app = NSApplication.shared
+    let d = Headless(body)
+    app.delegate = d
+    app.setActivationPolicy(.accessory)
+    app.run()
     exit(0)
 }
-
-// `wifirank --render-window out.png [--dark]` draws the networks window off-screen.
-if let i = CommandLine.arguments.firstIndex(of: "--render-window"), i + 1 < CommandLine.arguments.count {
-    _ = NSApplication.shared
-    let r = scan()
-    let w = NetworksWindow(onRescan: {})
-    let appearance = NSAppearance(named: CommandLine.arguments.contains("--dark") ? .darkAqua : .aqua)!
-    w.window.appearance = appearance
-    w.window.setContentSize(NSSize(width: 700, height: 440))
-    if let k = CommandLine.arguments.firstIndex(of: "--sort"), k + 1 < CommandLine.arguments.count {
-        let key = CommandLine.arguments[k + 1]
-        w.table.sortDescriptors = [NSSortDescriptor(key: key, ascending: key == "name" || key == "band" || key == "channel")]
-    }
-    w.update(nets: r.nets, error: r.error, scanning: false, updated: Date())
-    let v = w.window.contentView!
-    v.layoutSubtreeIfNeeded()
-    w.table.layoutSubtreeIfNeeded()
-    let rep = v.bitmapImageRepForCachingDisplay(in: v.bounds)!
-    appearance.performAsCurrentDrawingAppearance { v.cacheDisplay(in: v.bounds, to: rep) }
-    try! rep.representation(using: .png, properties: [:])!.write(to: URL(fileURLWithPath: CommandLine.arguments[i + 1]))
-    exit(0)
-}
-
-// `wifirank --print` runs one scan and prints it, for checking without the menu bar.
-if CommandLine.arguments.contains("--print") {
-    let r = scan()
-    if let e = r.error { print("error:", e) }
-    r.nets.forEach { print(($0.current ? "✓ " : "  ") + line($0) + ($0.saved ? "   [known]" : "")) }
-    exit(0)
-}
-
-let app = NSApplication.shared
-let delegate = App()
-app.delegate = delegate
-app.setActivationPolicy(.accessory)
-app.run()
