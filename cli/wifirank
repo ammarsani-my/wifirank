@@ -67,7 +67,7 @@ def best_first(r):
     return (-(r["snr"] if r["snr"] is not None else -999), -r["sig"])
 
 
-BAND = r"[-_ ]?(2\.4|2|5|6)\s*g(hz)?\b"
+BAND = r"[-_ ]?(2\.4|2|5|6)\s*g(hz)?(?![a-z0-9])|[-_ ](2\.4|5)$"
 
 
 def same_box(x, y):

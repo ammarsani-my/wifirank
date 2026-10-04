@@ -15,6 +15,10 @@ struct Net {
     var devices: Int? = nil
     /// Other access points heard on the same channel.
     var sameChannel = 0
+    /// How wide a slice of airwaves the network uses, in MHz.
+    var width: Int? = nil
+    /// Wi-Fi generation the router advertises: "4", "5", "6", "6E", "7", or "old".
+    var generation: String? = nil
     var snr: Int? { noise == 0 ? nil : rssi - noise }
 }
 
@@ -54,6 +58,128 @@ func busyLevel(_ percent: Int) -> (word: String, color: NSColor) {
     case ..<30: return ("Comfortable", .systemGreen)
     case ..<60: return ("Getting crowded", .systemOrange)
     default: return ("Crowded", .systemRed)
+    }
+}
+
+/// Networks broadcast by the same router, for the window's "Group by Router" view.
+/// The rules match `same_box()` / `family()` in cli/wifirank; keep the two in step.
+struct RouterGroup {
+    let id: Int
+    let names: [String]
+    let accessPoints: Int
+    let radios: Int
+
+    /// "Office" when every name is one network on different bands, otherwise "6 names".
+    var label: String {
+        let bases = Set(names.map(bandless))
+        return bases.count == 1 ? baseName(names.min { $0.count < $1.count } ?? "") : "\(names.count) names"
+    }
+}
+
+private let bandMarker = #"[-_ ]?(2\.4|2|5|6)\s*g(hz)?(?![a-z0-9])|[-_ ](2\.4|5)$"#
+
+/// Name with any band marker removed, lowercased, for matching "Office" with "Office 5G".
+func bandless(_ ssid: String) -> String {
+    ssid.lowercased()
+        .replacingOccurrences(of: bandMarker, with: "", options: .regularExpression)
+        .replacingOccurrences(of: #"[-_ ]+"#, with: "_", options: .regularExpression)
+        .trimmingCharacters(in: CharacterSet(charactersIn: "_"))
+}
+
+/// Name with any band marker removed, keeping its capitals.
+func baseName(_ ssid: String) -> String {
+    let s = ssid.replacingOccurrences(of: bandMarker, with: "", options: [.regularExpression, .caseInsensitive])
+        .trimmingCharacters(in: CharacterSet(charactersIn: " _-"))
+    return s.isEmpty ? ssid : s
+}
+
+private func addressBytes(_ bssid: String) -> [Int]? {
+    let parts = bssid.split(separator: ":").compactMap { Int($0, radix: 16) }
+    return parts.count == 6 ? parts : nil
+}
+
+/// Radios in one box share the 4th and 5th address bytes and have last bytes close together
+/// (…:b2/…:b3); separate boxes jump further (…:ac/…:75).
+private func sameBox(_ a: [Int], _ b: [Int]) -> Bool { a[3] == b[3] && a[4] == b[4] && abs(a[5] - b[5]) <= 16 }
+
+/// Groups every radio in a scan by router: same first five address bytes, same box, or the
+/// same name once band markers are removed. Returns each visible network name's group.
+func routerGroups(_ all: [Net]) -> [String: RouterGroup] {
+    var parent = Array(all.indices), boxParent = Array(all.indices)
+    func find(_ x: Int, _ p: inout [Int]) -> Int {
+        var x = x
+        while p[x] != x { p[x] = p[p[x]]; x = p[x] }
+        return x
+    }
+    func union(_ a: Int, _ b: Int, _ p: inout [Int]) {
+        let ra = find(a, &p), rb = find(b, &p)
+        if ra != rb { p[ra] = rb }
+    }
+    let addr = all.map { addressBytes($0.bssid) }
+    let family = all.map { $0.ssid == "(hidden)" ? "" : bandless($0.ssid) }
+    for i in all.indices {
+        for j in all.indices where j > i {
+            if let a = addr[i], let b = addr[j] {
+                if sameBox(a, b) {
+                    union(i, j, &parent)
+                    union(i, j, &boxParent)
+                    continue
+                }
+                if a[0..<5] == b[0..<5] { union(i, j, &parent); continue }
+            }
+            if !family[i].isEmpty, family[i] == family[j] { union(i, j, &parent) }
+        }
+    }
+    var members: [Int: [Int]] = [:]
+    for i in all.indices { members[find(i, &parent), default: []].append(i) }
+    var out: [String: RouterGroup] = [:]
+    for (root, idx) in members {
+        let names = Array(Set(idx.map { all[$0].ssid }.filter { $0 != "(hidden)" })).sorted { $0.lowercased() < $1.lowercased() }
+        let withAddr = idx.filter { addr[$0] != nil }
+        let boxes = Set(withAddr.map { find($0, &boxParent) }).count
+        let radios = Set(withAddr.map { all[$0].bssid }).count
+        let g = RouterGroup(id: root, names: names, accessPoints: max(boxes, 1), radios: max(radios, idx.count))
+        for n in names { out[n] = g }
+    }
+    return out
+}
+
+/// The Wi-Fi generation a beacon advertises, from which capability elements it carries:
+/// HT (45) = Wi-Fi 4, VHT (191) = Wi-Fi 5, HE (255/35) = Wi-Fi 6, EHT (255/108) = Wi-Fi 7.
+func wifiGeneration(_ ie: Data?, band: String) -> String? {
+    guard let ie else { return nil }
+    let b = [UInt8](ie)
+    var ht = false, vht = false, he = false, eht = false
+    var i = 0
+    while i + 2 <= b.count {
+        let id = b[i], len = Int(b[i + 1])
+        guard i + 2 + len <= b.count else { break }
+        switch id {
+        case 45: ht = true
+        case 191: vht = true
+        case 255 where len >= 1:
+            if b[i + 2] == 35 { he = true }
+            if b[i + 2] == 108 { eht = true }
+        default: break
+        }
+        i += 2 + len
+    }
+    if eht { return "7" }
+    if he { return band == "6G" ? "6E" : "6" }
+    if vht && band == "5G" { return "5" }   // Wi-Fi 5 is 5G-only; some 2.4G routers carry the element anyway
+    if ht { return "4" }
+    return "old"
+}
+
+/// Plain-English description of a generation, and a colour if it holds speed back.
+func generationInfo(_ g: String) -> (text: String, color: NSColor?) {
+    switch g {
+    case "7": return ("Wi-Fi 7 (2024): the newest.", nil)
+    case "6E": return ("Wi-Fi 6E (2021): Wi-Fi 6 on the uncrowded 6 GHz band.", nil)
+    case "6": return ("Wi-Fi 6 (2019): fast, and copes well with many devices.", nil)
+    case "5": return ("Wi-Fi 5 (2014): fast, but slows down more with many devices.", nil)
+    case "4": return ("Wi-Fi 4 (2009): older and slower; caps your speed even with a good signal.", .systemOrange)
+    default: return ("Older than Wi-Fi 4: very slow.", .systemRed)
     }
 }
 
@@ -174,6 +300,8 @@ func scanAll() -> (nets: [Net], error: String?) {
         }
         let ch = n.wlanChannel?.channelNumber
         net.sameChannel = found.filter { $0.wlanChannel?.channelNumber == ch }.count - 1
+        net.width = [1: 20, 2: 40, 3: 80, 4: 160][n.wlanChannel?.channelWidth.rawValue ?? 0]
+        net.generation = wifiGeneration(n.informationElementData, band: net.band)
         return net
     }
     return (nets, nil)
@@ -254,6 +382,11 @@ final class RowView: NSView {
     let iconName: String?
     let iconValue: Double?
     let checked: Bool
+    /// Short text drawn in its own column before the title (the band, for networks).
+    var lead: String?
+    var leadWidth: CGFloat = 0
+    /// Optional colour per right-hand column; nil means the usual grey.
+    var colColors: [NSColor?] = []
     var action: (() -> Void)?
     var keepsMenuOpen = false    // run the action without closing the menu
     var interactive = true       // false = shown only, never highlighted or clicked
@@ -302,11 +435,17 @@ final class RowView: NSView {
             }
             let digits = NSFont.monospacedDigitSystemFont(ofSize: font.pointSize, weight: .regular)
             var right = edge
-            for (col, w) in zip(columns, colWidths).reversed() {
-                text(col, x: right - w, maxX: right, font: digits, color: secondary, alignment: .right)
+            for (i, (col, w)) in zip(columns, colWidths).enumerated().reversed() {
+                let color = on ? secondary : ((i < colColors.count ? colColors[i] : nil) ?? secondary)
+                text(col, x: right - w, maxX: right, font: digits, color: color, alignment: .right)
                 right -= w + Grid.colGap
             }
-            text(title, x: Grid.text, maxX: right, font: font, color: primary)
+            var x = Grid.text
+            if let lead {
+                text(lead, x: x, maxX: x + leadWidth, font: digits, color: secondary, alignment: .right)
+                x += leadWidth + Grid.colGap
+            }
+            text(title, x: x, maxX: right, font: font, color: primary)
         }
     }
 
@@ -352,7 +491,8 @@ func buildItems(nets: [Net], error: String?, scanning: Bool, updated: Date?, det
     func w(_ t: String, _ f: NSFont) -> CGFloat { ceil((t as NSString).size(withAttributes: [.font: f]).width) }
     func span(_ cols: [CGFloat]) -> CGFloat { cols.reduce(0, +) + CGFloat(max(0, cols.count - 1)) * Grid.colGap }
 
-    let netCols = (detailed ? ["2.4G", "SNR 100", "-100 dBm", "ch 165"] : ["2.4G"]).map { w($0, digits) }
+    let bandWidth = w("2.4G", digits)
+    let netCols = (detailed ? ["SNR 100", "100% busy", "-100 dBm", "ch 165"] : []).map { w($0, digits) }
     let keyCols = [w("⌘R", digits)]
     let f = DateFormatter()
     f.dateFormat = "h:mm a"
@@ -360,7 +500,7 @@ func buildItems(nets: [Net], error: String?, scanning: Bool, updated: Date?, det
         : updated.map { "Updated \(f.string(from: $0))  ·  \(nets.count) networks" } ?? "Click to scan"
 
     let longestName = min(nets.map { w($0.ssid, font) }.max() ?? 0, 260)
-    let width = ceil(max(Grid.text + longestName + 24 + span(netCols) + Grid.right,
+    let width = ceil(max(Grid.text + bandWidth + Grid.colGap + longestName + 24 + span(netCols) + Grid.right,
                          Grid.text + w("Rescan", font) + 24 + span(keyCols) + Grid.right,
                          Grid.icon + w(status, small) + Grid.right,
                          240))
@@ -379,10 +519,13 @@ func buildItems(nets: [Net], error: String?, scanning: Bool, updated: Date?, det
 
     func addNetwork(_ n: Net) {
         let snr = n.snr.map(String.init) ?? "-"
-        let cols = detailed ? [n.band, "SNR \(snr)", "\(n.rssi) dBm", "ch \(n.channel)"] : [n.band]
+        let busy = n.busyPercent.map { "\($0)% busy" } ?? "–"
+        let cols = detailed ? ["SNR \(snr)", busy, "\(n.rssi) dBm", "ch \(n.channel)"] : []
         let v = RowView(kind: .item, title: n.ssid, width: width, columns: cols, colWidths: netCols,
                         iconName: "wifi", iconValue: min(1, max(0, Double(n.rssi + 90) / 40)), checked: n.current)
-        v.toolTip = "Security: \(n.security)\(n.saved ? "  ·  known network" : "")"
+        v.lead = n.band
+        v.leadWidth = bandWidth
+        if detailed { v.colColors = [n.snr.map { snrLevel($0).color }, n.busyPercent.map { busyLevel($0).color }] }
         v.interactive = false
         add(v)
     }
@@ -438,6 +581,8 @@ final class NetworksWindow: NSObject, NSTableViewDataSource, NSTableViewDelegate
     let table = NSTableView()
     let status = NSTextField(labelWithString: "")
     let rescanButton: NSButton
+    let groupBox = NSButton(checkboxWithTitle: "Group by Router", target: nil, action: nil)
+    var groups: [String: RouterGroup] = [:]
     let tabs = NSSegmentedControl(labels: ["Networks", "Speed"], trackingMode: .selectOne, target: nil, action: nil)
     let networksView = NSView()
     let speedTab: SpeedTab
@@ -447,19 +592,25 @@ final class NetworksWindow: NSObject, NSTableViewDataSource, NSTableViewDelegate
     // id, title, width, default sort (nil = not sortable), header tooltip
     static let columns: [(String, String, CGFloat, NSSortDescriptor?, String)] = [
         ("icon", "", 44, nil, ""),
-        ("name", "Network", 210, NSSortDescriptor(key: "name", ascending: true),
-         "The network's name. A tick means you're connected to it."),
         ("band", "Band", 50, NSSortDescriptor(key: "band", ascending: true),
          "2.4G reaches further but is slower and more crowded. 5G is faster but weaker through walls."),
+        ("name", "Network", 150, NSSortDescriptor(key: "name", ascending: true),
+         "The network's name. A tick means you're connected to it."),
         ("snr", "SNR", 44, NSSortDescriptor(key: "snr", ascending: false),
          "How far the signal stands out above background noise. The best guide to real speed: green 25 and above is good, "
             + "orange 10–24 works but may slow, red under 10 will struggle. Hover a value to see the signal and noise behind it."),
-        ("channel", "Channel", 62, NSSortDescriptor(key: "channel", ascending: true),
-         "Which lane in the band the network uses. Networks on the same channel slow each other down."),
         ("busy", "Busy", 54, NSSortDescriptor(key: "busy", ascending: true),
          "How much of the channel's airtime is already in use, as the router reports it. Lower is better: "
             + "green under 30% is comfortable, orange 30–59% is getting crowded, red 60% and over is crowded. "
             + "Not every router reports it; hover a value for details."),
+        ("width", "Width", 62, NSSortDescriptor(key: "width", ascending: false),
+         "How wide a slice of airwaves the network uses. Wider carries more at once: 80 MHz is roughly four times "
+            + "20 MHz. Usually 20 or 40 on 2.4G, 80 or 160 on 5G."),
+        ("wifi", "Wi-Fi", 50, NSSortDescriptor(key: "wifi", ascending: false),
+         "The Wi-Fi generation the router supports: 4, 5, 6, 6E or 7. Newer is faster and copes better with crowds. "
+            + "Orange 4 or older holds your speed back even with a good signal."),
+        ("channel", "Channel", 62, NSSortDescriptor(key: "channel", ascending: true),
+         "Which lane in the band the network uses. Networks on the same channel slow each other down."),
         ("security", "Security", 88, nil,
          "The encryption the network offers (approximate). Orange Open means no password and no encryption; "
             + "red WEP is easy to crack."),
@@ -472,7 +623,7 @@ final class NetworksWindow: NSObject, NSTableViewDataSource, NSTableViewDelegate
     init(onRescan: @escaping () -> Void, currentNet: @escaping () -> Net?) {
         self.onRescan = onRescan
         speedTab = SpeedTab(currentNet: currentNet)
-        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 700, height: 480),
+        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 760, height: 480),
                           styleMask: [.titled, .closable], backing: .buffered, defer: false)
         rescanButton = NSButton(title: "Rescan", image: NSImage(systemSymbolName: "arrow.clockwise", accessibilityDescription: nil)!,
                                 target: nil, action: nil)
@@ -485,7 +636,7 @@ final class NetworksWindow: NSObject, NSTableViewDataSource, NSTableViewDelegate
         window.isReleasedWhenClosed = false
         // Fixed size; only the position is remembered between openings.
         if window.setFrameUsingName("WiFiRankNetworks") {
-            window.setContentSize(NSSize(width: 700, height: 480))
+            window.setContentSize(NSSize(width: 760, height: 480))
         } else {
             window.center()
         }
@@ -531,6 +682,11 @@ final class NetworksWindow: NSObject, NSTableViewDataSource, NSTableViewDelegate
         rescanButton.keyEquivalentModifierMask = .command
         // A long status trims with "…" rather than widening the window.
         status.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        groupBox.target = self
+        groupBox.action = #selector(groupChanged)
+        groupBox.state = UserDefaults.standard.bool(forKey: "groupByRouter") ? .on : .off
+        groupBox.toolTip = "Show networks that come from the same router together, like a company router "
+            + "broadcasting several names. Off shows Known and Other networks."
         tabs.selectedSegment = Tab.networks.rawValue
         tabs.target = self
         tabs.action = #selector(tabChanged)
@@ -545,7 +701,7 @@ final class NetworksWindow: NSObject, NSTableViewDataSource, NSTableViewDelegate
             v.translatesAutoresizingMaskIntoConstraints = false
             content.addSubview(v)
         }
-        for v in [status, rescanButton, scroll, hint] as [NSView] {
+        for v in [status, groupBox, rescanButton, scroll, hint] as [NSView] {
             v.translatesAutoresizingMaskIntoConstraints = false
             networksView.addSubview(v)
         }
@@ -566,7 +722,9 @@ final class NetworksWindow: NSObject, NSTableViewDataSource, NSTableViewDelegate
             rescanButton.trailingAnchor.constraint(equalTo: n.trailingAnchor, constant: -16),
             status.leadingAnchor.constraint(equalTo: n.leadingAnchor, constant: 16),
             status.centerYAnchor.constraint(equalTo: rescanButton.centerYAnchor),
-            status.trailingAnchor.constraint(lessThanOrEqualTo: rescanButton.leadingAnchor, constant: -12),
+            groupBox.trailingAnchor.constraint(equalTo: rescanButton.leadingAnchor, constant: -16),
+            groupBox.centerYAnchor.constraint(equalTo: rescanButton.centerYAnchor),
+            status.trailingAnchor.constraint(lessThanOrEqualTo: groupBox.leadingAnchor, constant: -12),
             scroll.topAnchor.constraint(equalTo: rescanButton.bottomAnchor, constant: 10),
             scroll.leadingAnchor.constraint(equalTo: n.leadingAnchor),
             scroll.trailingAnchor.constraint(equalTo: n.trailingAnchor),
@@ -593,7 +751,13 @@ final class NetworksWindow: NSObject, NSTableViewDataSource, NSTableViewDelegate
 
     func windowWillClose(_ notification: Notification) { onClose() }
 
-    func update(nets: [Net], error: String?, scanning: Bool, updated: Date?) {
+    @objc func groupChanged() {
+        UserDefaults.standard.set(groupBox.state == .on, forKey: "groupByRouter")
+        rebuildRows()
+    }
+
+    func update(nets: [Net], error: String?, scanning: Bool, updated: Date?, groups: [String: RouterGroup]? = nil) {
+        if let groups { self.groups = groups }
         let f = DateFormatter()
         f.dateFormat = "h:mm a"
         status.stringValue = scanning ? "Scanning…"
@@ -611,6 +775,10 @@ final class NetworksWindow: NSObject, NSTableViewDataSource, NSTableViewDelegate
         case "snr": return (a.snr ?? -999, a.rssi) < (b.snr ?? -999, b.rssi)
         case "channel": return a.channel < b.channel
         case "busy": return (a.busyPercent ?? 999) < (b.busyPercent ?? 999)
+        case "width": return (a.width ?? 0, a.snr ?? -999) < (b.width ?? 0, b.snr ?? -999)
+        case "wifi":
+            let rank = ["old": 1, "4": 4, "5": 5, "6": 6, "6E": 6, "7": 7]
+            return (rank[a.generation ?? ""] ?? 0, a.snr ?? -999) < (rank[b.generation ?? ""] ?? 0, b.snr ?? -999)
         default: return a.rssi < b.rssi
         }
     }
@@ -625,10 +793,30 @@ final class NetworksWindow: NSObject, NSTableViewDataSource, NSTableViewDelegate
             return asc ? self.less(a, b, key) : self.less(b, a, key)
         }
         rows = []
-        let known = nets.filter { $0.saved }.sorted(by: order)
-        let others = nets.filter { !$0.saved }.sorted(by: order)
-        if !known.isEmpty { rows.append(.header("Known Networks")); rows += known.map { .net($0) } }
-        if !others.isEmpty { rows.append(.header("Other Networks")); rows += others.map { .net($0) } }
+        if groupBox.state == .on {
+            // Routers broadcasting two or more of the visible names, then everything else.
+            let byRouter = Dictionary(grouping: nets) { groups[$0.ssid]?.id ?? -1 }
+            var routers: [[Net]] = [], alone: [Net] = []
+            for (id, members) in byRouter {
+                if id != -1, members.count > 1 { routers.append(members.sorted(by: order)) } else { alone += members }
+            }
+            routers.sort { order($0[0], $1[0]) }
+            for members in routers {
+                guard let g = groups[members[0].ssid] else { continue }
+                let aps = g.accessPoints == 1 ? "1 access point" : "\(g.accessPoints) access points"
+                rows.append(.header("Router  ·  \(g.label)  ·  \(aps)"))
+                rows += members.map { .net($0) }
+            }
+            if !alone.isEmpty {
+                rows.append(.header(routers.isEmpty ? "Networks" : "On their own"))
+                rows += alone.sorted(by: order).map { .net($0) }
+            }
+        } else {
+            let known = nets.filter { $0.saved }.sorted(by: order)
+            let others = nets.filter { !$0.saved }.sorted(by: order)
+            if !known.isEmpty { rows.append(.header("Known Networks")); rows += known.map { .net($0) } }
+            if !others.isEmpty { rows.append(.header("Other Networks")); rows += others.map { .net($0) } }
+        }
         table.reloadData()
     }
 
@@ -658,6 +846,13 @@ final class NetworksWindow: NSObject, NSTableViewDataSource, NSTableViewDelegate
                 cell.toolTip = snrExplanation(n)
                 return cell
             case "rssi": return label("\(n.rssi) dBm", font: digits, color: .secondaryLabelColor, align: .center)
+            case "width": return label(n.width.map { "\($0) MHz" } ?? "–", font: digits, color: .secondaryLabelColor, align: .center)
+            case "wifi":
+                let info = n.generation.map(generationInfo)
+                let cell = label(n.generation.map { $0 == "old" ? "≤3" : $0 } ?? "–", font: digits,
+                                 color: info?.color ?? .secondaryLabelColor, align: .center)
+                cell.toolTip = info?.text
+                return cell
             case "channel": return label(String(n.channel), font: digits, color: .secondaryLabelColor, align: .center)
             case "busy":
                 let level = n.busyPercent.map(busyLevel)
@@ -733,21 +928,6 @@ final class NetworksWindow: NSObject, NSTableViewDataSource, NSTableViewDelegate
     }
 }
 
-/// The app's icon: a white Wi-Fi symbol on a blue rounded square.
-func makeAppIcon() -> NSImage {
-    NSImage(size: NSSize(width: 512, height: 512), flipped: false) { r in
-        let tile = NSBezierPath(roundedRect: r.insetBy(dx: 50, dy: 50), xRadius: 92, yRadius: 92)
-        NSGradient(starting: NSColor(srgbRed: 0.20, green: 0.56, blue: 1.0, alpha: 1),
-                   ending: NSColor(srgbRed: 0.04, green: 0.36, blue: 0.86, alpha: 1))?.draw(in: tile, angle: -90)
-        let cfg = NSImage.SymbolConfiguration(pointSize: 210, weight: .semibold).applying(.init(paletteColors: [.white]))
-        if let sym = NSImage(systemSymbolName: "wifi", accessibilityDescription: nil)?.withSymbolConfiguration(cfg) {
-            let s = sym.size
-            sym.draw(in: NSRect(x: r.midX - s.width / 2, y: r.midY - s.height / 2, width: s.width, height: s.height))
-        }
-        return true
-    }
-}
-
 final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
     let menu = NSMenu()
@@ -758,6 +938,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var detailed = false   // menu was opened with Option held
     var networksWindow: NetworksWindow?
     var speedWindow: SpeedWindow?
+    var groups: [String: RouterGroup] = [:]
     var launchedAtLogin = false
     var backgroundScans: Timer?
     /// How often to look for a better known network while the app runs.
@@ -816,10 +997,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func toggleBetterAlerts() { Notifier.shared.betterAlertsOn.toggle() }
 
     func applicationDidFinishLaunching(_ note: Notification) {
-        NSApp.applicationIconImage = makeAppIcon()
-        let img = NSImage(systemSymbolName: "antenna.radiowaves.left.and.right", accessibilityDescription: "WiFi Rank")
-        img?.isTemplate = true
-        item.button?.image = img
+        item.button?.image = makeMenuBarIcon()
         item.button?.target = self
         item.button?.action = #selector(clicked)
         item.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])
@@ -860,7 +1038,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                             currentNet: { [weak self] in self?.currentNet })
             networksWindow?.onClose = { [weak self] in DispatchQueue.main.async { self?.updateDockPresence() } }
         }
-        networksWindow?.update(nets: nets, error: error, scanning: scanning, updated: updated)
+        networksWindow?.update(nets: nets, error: error, scanning: scanning, updated: updated, groups: groups)
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
         networksWindow?.window.makeKeyAndOrderFront(nil)
@@ -935,6 +1113,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 let r = scanAll()
                 DispatchQueue.main.async {
                     self.nets = ranked(r.nets)
+                    self.groups = routerGroups(r.nets)
                     self.error = ok ? r.error : locationOffMessage
                     self.updated = Date()
                     self.scanning = false
@@ -950,7 +1129,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.removeAllItems()
         buildItems(nets: nets, error: error, scanning: scanning, updated: updated, detailed: detailed,
                    app: self).forEach(menu.addItem)
-        networksWindow?.update(nets: nets, error: error, scanning: scanning, updated: updated)
+        networksWindow?.update(nets: nets, error: error, scanning: scanning, updated: updated, groups: groups)
     }
 
     @objc func toggleLogin() {

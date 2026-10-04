@@ -1,6 +1,16 @@
 // The speed test UI: the dial panel (Speed tab and the small speed window share it)
 // and the history chart.
 import AppKit
+import CoreWLAN
+
+/// The current Wi-Fi connection's link rate and generation, e.g. "Wi-Fi link 1200 Mbps · Wi-Fi 6".
+func currentLink() -> String? {
+    guard let iface = CWWiFiClient.shared().interface(), iface.ssid() != nil || iface.transmitRate() > 0 else { return nil }
+    let rate = Int(iface.transmitRate().rounded())
+    guard rate > 0 else { return nil }
+    let gen = [4: "Wi-Fi 4", 5: "Wi-Fi 5", 6: "Wi-Fi 6", 7: "Wi-Fi 7"][iface.activePHYMode().rawValue]
+    return "Wi-Fi link \(rate) Mbps" + (gen.map { " · \($0)" } ?? "")
+}
 
 /// Speedometer dial. The scale is stretched at the low end, like Ookla's, so everyday
 /// speeds use most of the arc.
@@ -67,6 +77,7 @@ private let dayAndTime: DateFormatter = {
 /// The dial, the numbers, and the Test button.
 final class SpeedPanel: NSView {
     let networkLabel = label(12)
+    let linkLabel = label(11)
     let dial = DialView()
     let number = label(32, .semibold, secondary: false, digits: true)
     let caption = label(11.5)
@@ -80,17 +91,20 @@ final class SpeedPanel: NSView {
     init(currentNet: @escaping () -> Net?) {
         self.currentNet = currentNet
         super.init(frame: NSRect(x: 0, y: 0, width: 270, height: 380))
+        linkLabel.toolTip = "The speed your Mac and the router are talking at right now. Your internet speed is usually "
+            + "much lower; when it is, the internet connection is the limit, not the Wi-Fi."
         quality.toolTip = "How much the delay grows when the connection is busy. High is best; it matters most for video calls and games."
         button.bezelStyle = .rounded
         button.controlSize = .large
         button.target = self
         button.action = #selector(pressed)
 
-        let stack = NSStackView(views: [networkLabel, dial, caption, details, quality, statusLabel, button])
+        let stack = NSStackView(views: [networkLabel, linkLabel, dial, caption, details, quality, statusLabel, button])
         stack.orientation = .vertical
         stack.alignment = .centerX
         stack.spacing = 6
-        stack.setCustomSpacing(10, after: networkLabel)
+        stack.setCustomSpacing(2, after: networkLabel)
+        stack.setCustomSpacing(10, after: linkLabel)
         stack.setCustomSpacing(10, after: caption)
         stack.setCustomSpacing(12, after: statusLabel)
         for v in [stack, number] as [NSView] {
@@ -126,6 +140,8 @@ final class SpeedPanel: NSView {
         let c = SpeedController.shared
         let net = c.isTesting ? c.network : currentNet()
         networkLabel.stringValue = net.map { "Internet · \($0.ssid)" } ?? "Not connected to Wi-Fi"
+        // The link rate belongs to the network you're on, so it only shows for that one.
+        linkLabel.stringValue = (net?.current ?? false) ? (currentLink() ?? " ") : " "
         switch c.state {
         case .testing(let started, let reading):
             dial.live = true

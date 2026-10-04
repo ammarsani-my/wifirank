@@ -2,11 +2,62 @@
 import AppKit
 import CoreWLAN
 
-// `wifirank --render-icon out.png` draws the app icon.
+/// Draws an image into a PNG of exactly `pixels` wide and high.
+func writeIconPNG(_ image: NSImage, pixels: Int, to path: String) {
+    let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: pixels, pixelsHigh: pixels, bitsPerSample: 8, samplesPerPixel: 4,
+                               hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)!
+    NSGraphicsContext.saveGraphicsState()
+    NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+    image.draw(in: NSRect(x: 0, y: 0, width: pixels, height: pixels))
+    NSGraphicsContext.restoreGraphicsState()
+    try! rep.representation(using: .png, properties: [:])!.write(to: URL(fileURLWithPath: path))
+}
+
+// `wifirank --render-icon out.png` draws the app icon at 1024 pixels.
 if let i = CommandLine.arguments.firstIndex(of: "--render-icon"), i + 1 < CommandLine.arguments.count {
     _ = NSApplication.shared
-    let icon = makeAppIcon()
-    let rep = NSBitmapImageRep(data: icon.tiffRepresentation!)!
+    writeIconPNG(makeAppIcon(size: 1024), pixels: 1024, to: CommandLine.arguments[i + 1])
+    exit(0)
+}
+
+// `wifirank --render-iconset DIR` writes every size macOS wants; build.sh turns it into AppIcon.icns.
+if let i = CommandLine.arguments.firstIndex(of: "--render-iconset"), i + 1 < CommandLine.arguments.count {
+    _ = NSApplication.shared
+    let dir = CommandLine.arguments[i + 1]
+    try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+    for points in [16, 32, 128, 256, 512] {
+        for scale in [1, 2] {
+            let px = points * scale
+            // Each size is drawn fresh, so small sizes drop the detail they can't show.
+            writeIconPNG(makeAppIcon(size: CGFloat(px)), pixels: px,
+                         to: "\(dir)/icon_\(points)x\(points)\(scale == 2 ? "@2x" : "").png")
+        }
+    }
+    exit(0)
+}
+
+// `wifirank --render-menubar-icon out.png` shows the menu bar icon on light and dark bars, 4x size.
+if let i = CommandLine.arguments.firstIndex(of: "--render-menubar-icon"), i + 1 < CommandLine.arguments.count {
+    _ = NSApplication.shared
+    let icon = makeMenuBarIcon()
+    let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 320, pixelsHigh: 200, bitsPerSample: 8, samplesPerPixel: 4,
+                               hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)!
+    NSGraphicsContext.saveGraphicsState()
+    NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+    for (k, dark) in [false, true].enumerated() {
+        let bar = NSRect(x: 0, y: CGFloat(k) * 100, width: 320, height: 100)
+        (dark ? NSColor(white: 0.17, alpha: 1) : NSColor(white: 0.92, alpha: 1)).setFill()
+        bar.fill()
+        // Tint the template the way macOS does: black on light bars, white on dark.
+        let tinted = NSImage(size: icon.size, flipped: false) { r in
+            icon.draw(in: r)
+            (dark ? NSColor.white : NSColor.black).set()
+            r.fill(using: .sourceAtop)
+            return true
+        }
+        tinted.draw(in: NSRect(x: 124, y: bar.minY + 14, width: 72, height: 72))   // 18 pt at 4x
+    }
+    NSGraphicsContext.restoreGraphicsState()
     try! rep.representation(using: .png, properties: [:])!.write(to: URL(fileURLWithPath: CommandLine.arguments[i + 1]))
     exit(0)
 }
@@ -85,6 +136,53 @@ if CommandLine.arguments.contains("--check-load") {
             print("\(name) ch \(String(ch).padding(toLength: 4, withPad: " ", startingAt: 0)) \(sameChannel) others on channel   \(load)")
         }
         print("--- \(withLoad) of \(found.count) access points broadcast busy info")
+    }
+}
+
+// `wifirank --check-details` shows, per access point, the Wi-Fi generation its beacon
+// advertises and its channel width, plus the current connection's link rate.
+if CommandLine.arguments.contains("--check-details") {
+    runHeadless { _, _ in
+        guard let iface = CWWiFiClient.shared().interface(),
+              let found = try? iface.scanForNetworks(withSSID: nil) else { print("scan failed"); return }
+        func generation(_ ie: Data?, band: String) -> String {
+            guard let ie else { return "no beacon data" }
+            let b = [UInt8](ie)
+            var ht = false, vht = false, he = false, eht = false
+            var i = 0
+            while i + 2 <= b.count {
+                let id = b[i], len = Int(b[i + 1])
+                guard i + 2 + len <= b.count else { break }
+                switch id {
+                case 45: ht = true
+                case 191: vht = true
+                case 255 where len >= 1:
+                    if b[i + 2] == 35 { he = true }
+                    if b[i + 2] == 108 { eht = true }
+                default: break
+                }
+                i += 2 + len
+            }
+            if eht { return "Wi-Fi 7" }
+            if he { return band == "6G" ? "Wi-Fi 6E" : "Wi-Fi 6" }
+            if vht && band == "5G" { return "Wi-Fi 5" }
+            if ht { return "Wi-Fi 4" }
+            return "older"
+        }
+        var counts: [String: Int] = [:]
+        for n in found.sorted(by: { $0.rssiValue > $1.rssiValue }) {
+            let net = Net(ssid: n.ssid ?? "(hidden)", bssid: "", rssi: 0, noise: 0, channel: 0, band: band(n), security: "", current: false)
+            let g = generation(n.informationElementData, band: net.band)
+            counts[g, default: 0] += 1
+            let w: String
+            switch n.wlanChannel?.channelWidth.rawValue ?? 0 {
+            case 1: w = "20 MHz"; case 2: w = "40 MHz"; case 3: w = "80 MHz"; case 4: w = "160 MHz"; default: w = "unknown"
+            }
+            let name = net.ssid.padding(toLength: 26, withPad: " ", startingAt: 0)
+            print("\(name) \(net.band.padding(toLength: 5, withPad: " ", startingAt: 0)) \(g.padding(toLength: 9, withPad: " ", startingAt: 0)) \(w)")
+        }
+        print("--- generations: \(counts.sorted { $0.key < $1.key }.map { "\($0.key) \($0.value)" }.joined(separator: ", "))")
+        print("--- connected: link rate \(Int(iface.transmitRate())) Mbps, mode raw \(iface.activePHYMode().rawValue) (6 = Wi-Fi 6, 7 = Wi-Fi 7)")
     }
 }
 
@@ -183,21 +281,29 @@ func previewHistory(current: String) -> [SpeedSample] {
 /// Sample networks for previews, covering every Busy level and the unknown case.
 func previewNetworks() -> [Net] {
     func n(_ ssid: String, _ snr: Int, _ band: String, _ ch: Int, busy: Int?, devices: Int? = nil, others: Int = 0,
-           current: Bool = false, saved: Bool = false, security: String = "wpa3 transition") -> Net {
-        var x = Net(ssid: ssid, bssid: "", rssi: -92 + snr, noise: -92, channel: ch, band: band, security: security,
+           current: Bool = false, saved: Bool = false, security: String = "wpa3 transition", bssid: String = "") -> Net {
+        var x = Net(ssid: ssid, bssid: bssid, rssi: -92 + snr, noise: -92, channel: ch, band: band, security: security,
                     current: current, saved: saved)
         x.busyPercent = busy
+        x.width = band == "5G" ? 80 : 20
+        x.generation = ssid == "Old Printer" ? "4" : (band == "5G" ? "6" : "5")
         x.devices = devices
         x.sameChannel = others
         return x
     }
-    return [n("Office", 34, "5G", 44, busy: 12, devices: 9, others: 1, current: true, saved: true),
-            n("Office-2.4", 30, "2.4G", 1, busy: 63, devices: 21, others: 5, saved: true),
+    var sample = [n("Office", 34, "5G", 44, busy: 12, devices: 9, others: 1, current: true, saved: true, bssid: "aa:11:22:33:44:10"),
+            n("Office-2.4", 30, "2.4G", 1, busy: 63, devices: 21, others: 5, saved: true, bssid: "aa:11:22:33:44:11"),
             n("Cafe Guest", 28, "2.4G", 6, busy: 41, devices: 6, others: 2, security: "open"),
             n("Neighbour_5G", 22, "5G", 36, busy: 3, devices: 1),
             n("Phone hotspot", 18, "5G", 149, busy: nil),
             n("Shop WiFi", 12, "2.4G", 11, busy: 58, devices: 4, others: 3),
             n("Old Printer", 6, "2.4G", 3, busy: nil, security: "wep")]
+    // A company router broadcasting three names from two access points (the FM pattern seen 2026-10-04).
+    for (name, first) in [("DeliveryMFM", "ee"), ("DeviceNet", "f2"), ("FM_Access", "e2")] {
+        sample.append(n(name, 33, "2.4G", 1, busy: 58, devices: 0, others: 5, bssid: "\(first):55:a8:e6:50:ac"))
+        sample.append(n(name, 27, "2.4G", 11, busy: 22, devices: 0, others: 5, bssid: "\(first):55:a8:e6:50:75"))
+    }
+    return sample
 }
 
 /// Puts the speed views into a preview state from `--speed-state testing|failed`.
@@ -229,7 +335,8 @@ func argument(after flag: String) -> String? {
 // [--sample-history]` draws the main window off-screen. MODE is network or session.
 if let path = argument(after: "--render-window") {
     runHeadless { all, error in
-        let nets = CommandLine.arguments.contains("--sample-networks") ? previewNetworks() : ranked(all)
+        let scan = CommandLine.arguments.contains("--sample-networks") ? previewNetworks() : all
+        let nets = ranked(scan)
         let current = nets.first { $0.current }
         if CommandLine.arguments.contains("--sample-history") {
             SpeedHistory.shared.useForPreview(previewHistory(current: current?.ssid ?? "SCM DEPT AP 2"))
@@ -238,11 +345,12 @@ if let path = argument(after: "--render-window") {
         let w = NetworksWindow(onRescan: {}, currentNet: { current })
         let appearance = NSAppearance(named: CommandLine.arguments.contains("--dark") ? .darkAqua : .aqua)!
         w.window.appearance = appearance
-        w.window.setContentSize(NSSize(width: 700, height: 480))
+        w.window.setContentSize(NSSize(width: 760, height: 480))
         if let key = argument(after: "--sort") {
             w.table.sortDescriptors = [NSSortDescriptor(key: key, ascending: ["name", "band", "channel", "busy"].contains(key))]
         }
-        w.update(nets: nets, error: error, scanning: false, updated: Date())
+        w.groupBox.state = CommandLine.arguments.contains("--group") ? .on : .off
+        w.update(nets: nets, error: error, scanning: false, updated: Date(), groups: routerGroups(scan))
         if argument(after: "--tab") == "speed" { w.select(.speed) }
         if argument(after: "--history") == "session" {
             w.speedTab.history.modeControl.selectedSegment = 1

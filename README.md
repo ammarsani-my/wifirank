@@ -23,13 +23,22 @@ app in the background with `--json` and formats what comes back.
 | Do this on the menu bar icon | Get this |
 |---|---|
 | Click | Network list, best first |
-| Option-click | Network list with full detail |
+| Option-click | Network list with full detail: SNR, Busy, signal and channel |
 | Shift-click | The WiFi Rank window |
 | Right-click / Control-click | Show/Hide window, Test Internet Speed, Better Network Alerts, Start at Login, Quit |
 
 Opening the app from the Dock, Spotlight or the Applications folder also shows
 the window. While the window is open the app sits in the Dock; closing it puts
 it back in the menu bar only.
+
+Each network shows its band (2.4G/5G) before its name. The window's columns
+run Band, Network, SNR, Busy, Width, Wi-Fi, Channel, Security: the deciding
+numbers first, background detail last.
+
+**Group by Router** (top of the Networks tab) switches from Known / Other to
+one section per router: names broadcast by the same box sit together under
+"Router · Office · 1 access point" or "Router · 6 names · 2 access points",
+followed by networks "On their own". It uses the same rules as `wifirank --bssid`.
 
 Both the list and the window split networks into **Known** (this Mac has joined
 them before) and **Other**. In the window, click a column title to sort and hover
@@ -43,6 +52,11 @@ chosen automatically). A dial follows the live download reading; at the end it
 shows download, upload, delay and responsiveness. A test takes about 20 seconds
 and uses some data. Other networks can't be tested without joining them, and
 macOS doesn't let apps do that.
+
+Under the network's name, the Speed panel shows the **Wi-Fi link**: the speed
+your Mac and the router are talking at right now (e.g. "1200 Mbps · Wi-Fi 6").
+Compare it with the test result: when the link is much faster than your
+internet, the internet connection is the limit, not the Wi-Fi.
 
 **Test Internet Speed…** in the right-click menu opens a small window with the
 same dial and starts a test straight away.
@@ -92,6 +106,12 @@ names on two access points shows as one group: "6 names · 2 access points".
   Used to break SNR ties.
 - **Band**: 2.4G reaches further but is slower and more crowded; 5G is faster but
   weaker through walls.
+- **Width**: how wide a slice of airwaves the network uses. Wider carries more
+  at once: 80 MHz is roughly four times 20 MHz. Usually 20 or 40 on 2.4G, 80 or
+  160 on 5G.
+- **Wi-Fi**: the generation the router supports (4, 5, 6, 6E, 7). Newer is
+  faster and copes better with crowds. **Orange** 4 or older holds your speed
+  back even with a good signal.
 - **Channel**: networks sharing a channel slow each other down.
 - **Busy**: how much of the channel's airtime is already in use, as the router
   reports it. Not IP addresses or the router's processor: think of a one-lane
@@ -125,6 +145,10 @@ is signed ad hoc and macOS asks again after every build. The certificate is
 self-made and only used on your Mac; it lives in its own keychain under
 `~/.config/wifirank/`.
 
+The icon (Wi-Fi arcs above the winner's step of a podium) is drawn in code;
+`build.sh` turns it into `AppIcon.icns` inside the app on every build, so the app
+icon and the menu bar icon always match.
+
 Installed locations:
 
 ```
@@ -147,6 +171,9 @@ new version.
 "build/WiFi Rank.app/Contents/MacOS/wifirank" --speed-test           # one real speed test, live readings printed
 "build/WiFi Rank.app/Contents/MacOS/wifirank" --check-better-rule    # better-network rule against made-up scans
 "build/WiFi Rank.app/Contents/MacOS/wifirank" --check-load           # which nearby routers report how busy they are
+"build/WiFi Rank.app/Contents/MacOS/wifirank" --check-details        # Wi-Fi generation and width per router, current link rate
+"build/WiFi Rank.app/Contents/MacOS/wifirank" --render-icon icon.png  # the app icon at 1024 pixels
+"build/WiFi Rank.app/Contents/MacOS/wifirank" --render-menubar-icon bar.png
 "build/WiFi Rank.app/Contents/MacOS/wifirank" --render-icon icon.png
 ```
 
@@ -172,3 +199,4 @@ new version.
 | `WiFiRank/Speed.swift` | Running the speed test and keeping its history |
 | `WiFiRank/SpeedViews.swift` | Dial panel, history chart, Speed tab, small speed window |
 | `WiFiRank/Notifier.swift` | Notifications and the better-network rule |
+| `WiFiRank/Icon.swift` | The podium icon: app icon at every size and the menu bar icon |

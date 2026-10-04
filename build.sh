@@ -83,6 +83,11 @@ build() {
     cp WiFiRank/Info.plist "$APP/Contents/Info.plist"
     swiftc -O -framework AppKit -framework CoreLocation -framework CoreWLAN -framework ServiceManagement \
         -framework UserNotifications -o "$APP/Contents/MacOS/wifirank" WiFiRank/*.swift
+    # The icon is drawn in code; turn it into the bundle's AppIcon.icns.
+    mkdir -p "$APP/Contents/Resources"
+    "$APP/Contents/MacOS/wifirank" --render-iconset "$BUILD/AppIcon.iconset"
+    iconutil -c icns -o "$APP/Contents/Resources/AppIcon.icns" "$BUILD/AppIcon.iconset"
+    rm -rf "$BUILD/AppIcon.iconset"
     local id
     id=$(signing_identity)
     if [ -n "$id" ]; then
@@ -105,6 +110,8 @@ case "${1:-}" in
         mkdir -p "$(dirname "$APP_DEST")" "$(dirname "$CLI_DEST")"
         cp -R "$APP" "$APP_DEST"
         install -m 755 cli/wifirank "$CLI_DEST"
+        # Tell macOS to pick up the (possibly new) icon instead of a cached one.
+        /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$APP_DEST" || true
         echo "installed $APP_DEST and $CLI_DEST"
         if pgrep -fq "WiFi Rank.app/Contents/MacOS/wifirank"; then
             echo "WiFi Rank is running the old version: quit it and open it again." >&2

@@ -6,6 +6,8 @@
 	<string>WiFi Rank</string>
 	<key>CFBundleExecutable</key>
 	<string>wifirank</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
 	<key>CFBundleIdentifier</key>
 	<string>local.ammarsani.wifirank</string>
 	<key>CFBundleName</key>
