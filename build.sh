@@ -81,6 +81,9 @@ build() {
     rm -rf "$APP"
     mkdir -p "$APP/Contents/MacOS"
     cp WiFiRank/Info.plist "$APP/Contents/Info.plist"
+    # A fresh build number every build: macOS caches app icons per version, so a stuck
+    # number kept a blank icon in notifications even after the app had a real one.
+    /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $(date +%Y%m%d%H%M%S)" "$APP/Contents/Info.plist"
     swiftc -O -framework AppKit -framework CoreLocation -framework CoreWLAN -framework ServiceManagement \
         -framework UserNotifications -o "$APP/Contents/MacOS/wifirank" WiFiRank/*.swift
     # The icon is drawn in code; turn it into the bundle's AppIcon.icns.
@@ -97,6 +100,9 @@ build() {
         echo "note: signed ad hoc; run ./build.sh setup-signing so location access survives rebuilds" >&2
     fi
     codesign --verify "$APP"
+    # Only the installed copy should be known to macOS; a registered build copy can steal
+    # the app's identity (notifications once showed a blank icon because of a stale one).
+    /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -u "$PWD/$APP" 2>/dev/null || true
     echo "built $APP"
 }
 

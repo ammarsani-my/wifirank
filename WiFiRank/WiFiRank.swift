@@ -61,7 +61,7 @@ func busyLevel(_ percent: Int) -> (word: String, color: NSColor) {
     }
 }
 
-/// Networks broadcast by the same router, for the window's "Group by Router" view.
+/// Networks broadcast by one cluster (same router or system), for the window's "Group into Clusters" view.
 /// The rules match `same_box()` / `family()` in cli/wifirank; keep the two in step.
 struct RouterGroup {
     let id: Int
@@ -307,6 +307,27 @@ func scanAll() -> (nets: [Net], error: String?) {
     return (nets, nil)
 }
 
+/// A cautious ceiling for the Wi-Fi link a network allows, in Mbps, from its SNR, channel width
+/// and Wi-Fi generation, assuming a two-stream Mac (the Wi-Fi 6 rate table). Real links usually
+/// run lower; it exists to rank networks, so SNR alone can't put a narrow 20 MHz network above
+/// a wide 80 MHz one.
+func estimatedSpeed(_ n: Net, snr override: Int? = nil) -> Double? {
+    guard let snr = override ?? n.snr else { return nil }
+    // SNR needed for each rate step (MCS 0–11), with a margin for real-world conditions.
+    let needed = [8, 11, 14, 17, 21, 25, 27, 29, 33, 35, 38, 41]
+    let perStream20MHz = [8.6, 17.2, 25.8, 34.4, 51.6, 68.8, 77.4, 86.0, 103.2, 114.7, 129.0, 143.4]
+    guard let step = needed.lastIndex(where: { snr >= $0 }) else { return 0 }
+    let topStep = ["4": 7, "5": 9, "old": 3][n.generation ?? ""] ?? 11
+    var widthFactor = [20: 1.0, 40: 2.0, 80: 4.19, 160: 8.38][n.width ?? 20] ?? 1.0
+    if n.generation == "4" { widthFactor = min(widthFactor, 2.0) }
+    return perStream20MHz[min(step, topStep)] * widthFactor * 2
+}
+
+func formatEstimate(_ v: Double?) -> String {
+    guard let v else { return "–" }
+    return v < 10 ? "<10 Mbps" : "~\(Int((v / 10).rounded()) * 10) Mbps"
+}
+
 /// One row per network name (its strongest transmitter), hidden networks dropped,
 /// best first: highest SNR, then stronger signal.
 func ranked(_ all: [Net]) -> [Net] {
@@ -320,7 +341,9 @@ func ranked(_ all: [Net]) -> [Net] {
             best[n.ssid] = n
         }
     }
-    return best.values.sorted { ($0.snr ?? -999, $0.rssi) > ($1.snr ?? -999, $1.rssi) }
+    return best.values.sorted {
+        (estimatedSpeed($0) ?? -1, $0.snr ?? -999, $0.rssi) > (estimatedSpeed($1) ?? -1, $1.snr ?? -999, $1.rssi)
+    }
 }
 
 func run(_ args: [String]) -> String {
@@ -581,7 +604,7 @@ final class NetworksWindow: NSObject, NSTableViewDataSource, NSTableViewDelegate
     let table = NSTableView()
     let status = NSTextField(labelWithString: "")
     let rescanButton: NSButton
-    let groupBox = NSButton(checkboxWithTitle: "Group by Router", target: nil, action: nil)
+    let groupBox = NSButton(checkboxWithTitle: "Group into Clusters", target: nil, action: nil)
     var groups: [String: RouterGroup] = [:]
     let tabs = NSSegmentedControl(labels: ["Networks", "Speed"], trackingMode: .selectOne, target: nil, action: nil)
     let networksView = NSView()
@@ -596,6 +619,9 @@ final class NetworksWindow: NSObject, NSTableViewDataSource, NSTableViewDelegate
          "2.4G reaches further but is slower and more crowded. 5G is faster but weaker through walls."),
         ("name", "Network", 150, NSSortDescriptor(key: "name", ascending: true),
          "The network's name. A tick means you're connected to it."),
+        ("speed", "Est. Speed", 84, NSSortDescriptor(key: "speed", ascending: false),
+         "A cautious estimate of the fastest Wi-Fi link this network allows, from its SNR, width and Wi-Fi generation. "
+            + "The list is ranked by it. Real links usually run lower, and it isn't your internet speed."),
         ("snr", "SNR", 44, NSSortDescriptor(key: "snr", ascending: false),
          "How far the signal stands out above background noise. The best guide to real speed: green 25 and above is good, "
             + "orange 10–24 works but may slow, red under 10 will struggle. Hover a value to see the signal and noise behind it."),
@@ -623,7 +649,7 @@ final class NetworksWindow: NSObject, NSTableViewDataSource, NSTableViewDelegate
     init(onRescan: @escaping () -> Void, currentNet: @escaping () -> Net?) {
         self.onRescan = onRescan
         speedTab = SpeedTab(currentNet: currentNet)
-        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 760, height: 480),
+        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 850, height: 480),
                           styleMask: [.titled, .closable], backing: .buffered, defer: false)
         rescanButton = NSButton(title: "Rescan", image: NSImage(systemSymbolName: "arrow.clockwise", accessibilityDescription: nil)!,
                                 target: nil, action: nil)
@@ -636,7 +662,7 @@ final class NetworksWindow: NSObject, NSTableViewDataSource, NSTableViewDelegate
         window.isReleasedWhenClosed = false
         // Fixed size; only the position is remembered between openings.
         if window.setFrameUsingName("WiFiRankNetworks") {
-            window.setContentSize(NSSize(width: 760, height: 480))
+            window.setContentSize(NSSize(width: 850, height: 480))
         } else {
             window.center()
         }
@@ -666,7 +692,7 @@ final class NetworksWindow: NSObject, NSTableViewDataSource, NSTableViewDelegate
         table.allowsColumnReordering = false
         table.floatsGroupRows = false
         table.columnAutoresizingStyle = .uniformColumnAutoresizingStyle
-        table.sortDescriptors = [NSSortDescriptor(key: "snr", ascending: false)]
+        table.sortDescriptors = [NSSortDescriptor(key: "speed", ascending: false)]
 
         let scroll = NSScrollView()
         scroll.documentView = table
@@ -685,12 +711,12 @@ final class NetworksWindow: NSObject, NSTableViewDataSource, NSTableViewDelegate
         groupBox.target = self
         groupBox.action = #selector(groupChanged)
         groupBox.state = UserDefaults.standard.bool(forKey: "groupByRouter") ? .on : .off
-        groupBox.toolTip = "Show networks that come from the same router together, like a company router "
-            + "broadcasting several names. Off shows Known and Other networks."
+        groupBox.toolTip = "Show related networks together in clusters: one router broadcasting several names, "
+            + "or an office's access points sharing a name. Off shows Known and Other networks."
         tabs.selectedSegment = Tab.networks.rawValue
         tabs.target = self
         tabs.action = #selector(tabChanged)
-        let hint = NSTextField(labelWithString: "Best pick: green SNR and green Busy. Hover a value or column title to see what it means; click a title to sort.")
+        let hint = NSTextField(labelWithString: "Best pick: the top of the list (ranked by estimated speed), ideally with green Busy. Hover anything for what it means.")
         hint.font = .systemFont(ofSize: 11)
         hint.textColor = .secondaryLabelColor
         hint.lineBreakMode = .byTruncatingTail
@@ -773,6 +799,7 @@ final class NetworksWindow: NSObject, NSTableViewDataSource, NSTableViewDelegate
         case "name": return a.ssid.localizedCaseInsensitiveCompare(b.ssid) == .orderedAscending
         case "band": return a.band < b.band
         case "snr": return (a.snr ?? -999, a.rssi) < (b.snr ?? -999, b.rssi)
+        case "speed": return (estimatedSpeed(a) ?? -1, a.snr ?? -999) < (estimatedSpeed(b) ?? -1, b.snr ?? -999)
         case "channel": return a.channel < b.channel
         case "busy": return (a.busyPercent ?? 999) < (b.busyPercent ?? 999)
         case "width": return (a.width ?? 0, a.snr ?? -999) < (b.width ?? 0, b.snr ?? -999)
@@ -786,7 +813,7 @@ final class NetworksWindow: NSObject, NSTableViewDataSource, NSTableViewDelegate
     /// Known networks first, then the rest, each sorted by the chosen column.
     func rebuildRows() {
         let sd = table.sortDescriptors.first
-        let key = sd?.key ?? "snr", asc = sd?.ascending ?? false
+        let key = sd?.key ?? "speed", asc = sd?.ascending ?? false
         let order: (Net, Net) -> Bool = { a, b in
             // Routers that don't report how busy they are go last, whichever way it's sorted.
             if key == "busy", (a.busyPercent == nil) != (b.busyPercent == nil) { return b.busyPercent == nil }
@@ -804,7 +831,7 @@ final class NetworksWindow: NSObject, NSTableViewDataSource, NSTableViewDelegate
             for members in routers {
                 guard let g = groups[members[0].ssid] else { continue }
                 let aps = g.accessPoints == 1 ? "1 access point" : "\(g.accessPoints) access points"
-                rows.append(.header("Router  ·  \(g.label)  ·  \(aps)"))
+                rows.append(.header("In one cluster  ·  \(g.label)  ·  \(aps)"))
                 rows += members.map { .net($0) }
             }
             if !alone.isEmpty {
@@ -840,6 +867,11 @@ final class NetworksWindow: NSObject, NSTableViewDataSource, NSTableViewDelegate
             case "icon": return signalCell(n)
             case "name": return label(n.ssid, font: font, color: .labelColor, align: .left)
             case "band": return label(n.band, font: digits, color: .secondaryLabelColor, align: .center)
+            case "speed":
+                let cell = label(formatEstimate(estimatedSpeed(n)), font: digits, color: .labelColor, align: .center)
+                cell.toolTip = "Rough ceiling: SNR \(n.snr.map(String.init) ?? "–"), \(n.width.map { "\($0) MHz" } ?? "unknown width")"
+                    + "\(n.generation.map { ", Wi-Fi \($0)" } ?? ""). Real links usually run lower."
+                return cell
             case "snr":
                 let level = n.snr.map(snrLevel)
                 let cell = label(n.snr.map(String.init) ?? "–", font: digits, color: level?.color ?? .secondaryLabelColor, align: .center)

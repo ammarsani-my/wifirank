@@ -1,6 +1,7 @@
 // Entry point: command-line modes first, otherwise the menu bar app.
 import AppKit
 import CoreWLAN
+import UserNotifications
 
 /// Draws an image into a PNG of exactly `pixels` wide and high.
 func writeIconPNG(_ image: NSImage, pixels: Int, to path: String) {
@@ -83,15 +84,21 @@ if CommandLine.arguments.contains("--speed-test") {
 
 // `wifirank --check-better-rule` runs the better-network rule against made-up scans.
 if CommandLine.arguments.contains("--check-better-rule") {
-    func net(_ ssid: String, snr: Int, current: Bool = false, saved: Bool = true) -> Net {
-        Net(ssid: ssid, bssid: "", rssi: -90 + snr, noise: -90, channel: 1, band: "5G", security: "wpa3", current: current, saved: saved)
+    func net(_ ssid: String, snr: Int, width: Int = 80, current: Bool = false, saved: Bool = true) -> Net {
+        var n = Net(ssid: ssid, bssid: "", rssi: -90 + snr, noise: -90, channel: 1, band: width > 40 ? "5G" : "2.4G",
+                    security: "wpa3", current: current, saved: saved)
+        n.width = width
+        n.generation = "6"
+        return n
     }
     let cases: [(String, [Net], String?)] = [
-        ("known network 6 points better", [net("Here", snr: 15, current: true), net("Better", snr: 21)], "Better"),
-        ("only 4 points better", [net("Here", snr: 18, current: true), net("Close", snr: 22)], nil),
-        ("better but not known", [net("Here", snr: 15, current: true), net("Stranger", snr: 40, saved: false)], nil),
-        ("5 better but below 20 overall", [net("Here", snr: 10, current: true), net("Weak", snr: 15)], nil),
-        ("picks the best of two", [net("Here", snr: 10, current: true), net("Good", snr: 25), net("Best", snr: 35)], "Best"),
+        ("wide 5G beats narrow 2.4G at similar SNR", [net("Here", snr: 30, width: 20, current: true), net("Wide", snr: 27)], "Wide"),
+        ("the real case: stay on 5G 80 MHz, don't drop to 2.4G 20 MHz",
+         [net("SCM 2", snr: 31, current: true), net("SCM 1", snr: 41, width: 20)], nil),
+        ("only slightly faster", [net("Here", snr: 29, current: true), net("Close", snr: 33)], nil),
+        ("faster but not known", [net("Here", snr: 15, current: true), net("Stranger", snr: 40, saved: false)], nil),
+        ("faster but below SNR 20", [net("Here", snr: 10, width: 20, current: true), net("Weak", snr: 15, width: 160)], nil),
+        ("picks the fastest of two", [net("Here", snr: 12, width: 20, current: true), net("Good", snr: 25, width: 40), net("Best", snr: 28)], "Best"),
         ("not connected", [net("Elsewhere", snr: 40)], nil),
     ]
     var ok = true
@@ -186,13 +193,27 @@ if CommandLine.arguments.contains("--check-details") {
     }
 }
 
+// `wifirank --test-notification` sends one notification, for checking how it looks.
+if CommandLine.arguments.contains("--test-notification") {
+    let c = UNMutableNotificationContent()
+    c.title = "WiFi Rank"
+    c.body = "Test notification: the podium icon should show on the left."
+    let center = UNUserNotificationCenter.current()
+    center.add(UNNotificationRequest(identifier: "test-\(Date().timeIntervalSince1970)", content: c, trigger: nil)) { error in
+        print(error.map { "failed: \($0.localizedDescription)" } ?? "sent")
+        exit(0)
+    }
+    RunLoop.main.run()
+}
+
 // `wifirank --json` prints every access point in range; the terminal command uses this.
 if CommandLine.arguments.contains("--json") {
     runHeadless { all, error in
         if let error, all.isEmpty { err(error) }
         let rows: [[String: Any]] = all.map {
             ["ssid": $0.ssid, "bssid": $0.bssid, "rssi": $0.rssi, "noise": $0.noise, "channel": $0.channel,
-             "band": $0.band, "security": $0.security, "current": $0.current, "known": $0.saved]
+             "band": $0.band, "security": $0.security, "current": $0.current, "known": $0.saved,
+             "estimate": estimatedSpeed($0) ?? NSNull()]
         }
         let data = (try? JSONSerialization.data(withJSONObject: rows)) ?? Data("[]".utf8)
         FileHandle.standardOutput.write(data)
@@ -345,7 +366,7 @@ if let path = argument(after: "--render-window") {
         let w = NetworksWindow(onRescan: {}, currentNet: { current })
         let appearance = NSAppearance(named: CommandLine.arguments.contains("--dark") ? .darkAqua : .aqua)!
         w.window.appearance = appearance
-        w.window.setContentSize(NSSize(width: 760, height: 480))
+        w.window.setContentSize(NSSize(width: 850, height: 480))
         if let key = argument(after: "--sort") {
             w.table.sortDescriptors = [NSSortDescriptor(key: key, ascending: ["name", "band", "channel", "busy"].contains(key))]
         }

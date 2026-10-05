@@ -18,7 +18,7 @@ def via_app():
     return [dict(ssid=r["ssid"], sig=r["rssi"], bssid=r["bssid"],
                  snr=r["rssi"] - r["noise"] if r["noise"] else None,
                  ch=str(r["channel"]), band=r["band"], sec=r["security"],
-                 cur=r["current"]) for r in rows]
+                 cur=r["current"], est=r.get("estimate")) for r in rows]
 
 
 def via_profiler():
@@ -63,8 +63,10 @@ def family(ssid):
 
 
 def best_first(r):
-    """Highest SNR first; stronger signal breaks ties. Same order as WiFi Rank."""
-    return (-(r["snr"] if r["snr"] is not None else -999), -r["sig"])
+    """Highest estimated speed first (worked out by the app from SNR, width and Wi-Fi
+    generation), then SNR, then signal. Same order as WiFi Rank."""
+    est = r.get("est")
+    return (-(est if est is not None else -1), -(r["snr"] if r["snr"] is not None else -999), -r["sig"])
 
 
 BAND = r"[-_ ]?(2\.4|2|5|6)\s*g(hz)?(?![a-z0-9])|[-_ ](2\.4|5)$"
@@ -86,13 +88,14 @@ def render(rows, indent=""):
     for n in rows:
         bar = "▂▄▆█"[min(3, max(0, (n["sig"] + 90) // 12))]
         snr = n["snr"] if n["snr"] is not None else "-"
+        est = "-" if n.get("est") is None else ("<10" if n["est"] < 10 else f"~{round(n['est'] / 10) * 10}")
         col = f"{n['bssid']:<18}" if show_bssid else ""
         print(f"{'*' if n['cur'] else ' '} {indent}{n['ssid'][:28 - len(indent)]:<{28 - len(indent)}} "
-              f"{snr:>4} {n['sig']:>5} {n['ch']:>4} {n['band']:<5} {bar} {col}{n['sec']}")
+              f"{est:>5} {snr:>4} {n['sig']:>5} {n['ch']:>4} {n['band']:<5} {bar} {col}{n['sec']}")
 
 
 head = f"{'BSSID':<18}" if show_bssid else ""
-print(f"  {'SSID':<28} {'SNR':>4} {'dBm':>5} {'CH':>4} {'BAND':<5}   {head}SECURITY")
+print(f"  {'SSID':<28} {'EST':>5} {'SNR':>4} {'dBm':>5} {'CH':>4} {'BAND':<5}   {head}SECURITY")
 
 if not show_bssid:
     # Plain view: one line per network name, strongest transmitter wins.
@@ -180,4 +183,4 @@ else:
             render(g)
         prev_grouped = grouped
 
-print("\n* = connected. Best pick: highest SNR, then strongest dBm.")
+print("\n* = connected. Ranked by EST, a cautious estimate of the fastest Wi-Fi link (Mbps)\n  from SNR, width and Wi-Fi generation. Real links usually run lower.")

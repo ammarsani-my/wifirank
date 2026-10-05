@@ -5,9 +5,9 @@ import UserNotifications
 final class Notifier: NSObject, UNUserNotificationCenterDelegate {
     static let shared = Notifier()
     static let betterPrefix = "better-"
-    /// How much higher a known network's SNR must be before it counts as clearly better.
-    /// Compared on averages of recent scans, because SNR wobbles by about 6 on its own.
-    static let snrMargin = 5
+    /// How much faster (estimated, from SNR and width) a known network must be to count as
+    /// clearly better. SNR is averaged over recent scans first, because it wobbles by about 6.
+    static let speedRatio = 1.5
     static let averageOver = 3
     static let minSNR = 20
     static let repeatAfter: TimeInterval = 3600
@@ -45,13 +45,15 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
              body: "\(s.ssid): \(formatMbps(s.down)) Mbps down · \(formatMbps(s.up)) up · \(Int(s.delay.rounded())) ms delay")
     }
 
-    /// The known network that beats the current one by a clear margin, if any. `snr` gives the
-    /// value to compare for each network (the app passes recent averages).
+    /// The known network whose estimated speed clearly beats the current one's, if any. `snr`
+    /// gives the SNR to use for each network (the app passes recent averages).
     static func clearlyBetter(_ nets: [Net], snr: (Net) -> Int? = { $0.snr }) -> Net? {
-        guard let current = nets.first(where: { $0.current }), let currentSNR = snr(current) else { return nil }
+        func speed(_ n: Net) -> Double { estimatedSpeed(n, snr: snr(n)) ?? 0 }
+        guard let current = nets.first(where: { $0.current }), snr(current) != nil else { return nil }
+        let bar = speed(current) * speedRatio
         return nets
-            .filter { $0.saved && !$0.current && (snr($0) ?? -999) >= max(currentSNR + snrMargin, minSNR) }
-            .max { (snr($0) ?? -999) < (snr($1) ?? -999) }
+            .filter { $0.saved && !$0.current && (snr($0) ?? -999) >= minSNR && speed($0) >= bar && speed($0) > 0 }
+            .max { speed($0) < speed($1) }
     }
 
     private func remember(_ nets: [Net]) {
@@ -87,10 +89,10 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
             guard !delivered.contains(where: { $0.request.identifier.hasPrefix(Self.betterPrefix) }) else { return }
             DispatchQueue.main.async {
                 self.lastSuggested[best.ssid] = Date()
-                self.send(id: Self.betterPrefix + best.ssid, title: "A better network is nearby",
-                          body: "\(best.ssid) is clearly stronger than \(current.ssid) "
-                              + "(SNR \(self.average(best) ?? 0) vs \(currentSNR), averaged over recent scans). "
-                              + "Switch from the Wi-Fi menu.")
+                let mine = estimatedSpeed(current, snr: currentSNR), theirs = estimatedSpeed(best, snr: self.average(best))
+                self.send(id: Self.betterPrefix + best.ssid, title: "A faster network is nearby",
+                          body: "\(best.ssid) should be clearly faster than \(current.ssid) (estimated \(formatEstimate(theirs)) vs "
+                              + "\(formatEstimate(mine)), from signal and channel width). Switch from the Wi-Fi menu.")
             }
         }
     }

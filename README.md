@@ -32,12 +32,19 @@ the window. While the window is open the app sits in the Dock; closing it puts
 it back in the menu bar only.
 
 Each network shows its band (2.4G/5G) before its name. The window's columns
-run Band, Network, SNR, Busy, Width, Wi-Fi, Channel, Security: the deciding
-numbers first, background detail last.
+run Band, Network, Est. Speed, SNR, Busy, Width, Wi-Fi, Channel, Security: the
+deciding numbers first, background detail last.
 
-**Group by Router** (top of the Networks tab) switches from Known / Other to
-one section per router: names broadcast by the same box sit together under
-"Router · Office · 1 access point" or "Router · 6 names · 2 access points",
+Networks are **ranked by estimated speed**: a cautious ceiling for the Wi-Fi link,
+worked out from SNR, channel width and Wi-Fi generation (the standard Wi-Fi 6 rate
+table, two streams, with a safety margin). SNR alone would rank a clean but narrow
+2.4G 20 MHz network above a wide 5G 80 MHz one that is actually faster. Real links
+usually run below the estimate, and it isn't your internet speed.
+
+**Group into Clusters** (top of the Networks tab) switches from Known / Other
+to one section per cluster: names broadcast by the same box, or by an office's
+access points sharing a name, sit together under
+"In one cluster · Office · 1 access point" or "In one cluster · 6 names · 2 access points",
 followed by networks "On their own". It uses the same rules as `wifirank --bssid`.
 
 Both the list and the window split networks into **Known** (this Mac has joined
@@ -72,10 +79,10 @@ Results live in `~/Library/Application Support/WiFi Rank/speed-history.json`.
 ### Notifications
 
 - **Speed test finished**, but only if you're not looking at the speed view.
-- **A better network is nearby**: one of your known networks has an SNR at
-  least 5 points higher than the one you're on (and at least 20), comparing the
-  average of the last 3 scans for each, on two scans in a row. Averaging matters
-  because SNR wobbles by about 6 on its own. Only one such alert at a time: no new one until you've dismissed the
+- **A faster network is nearby**: one of your known networks has an estimated
+  speed at least 1.5× yours (and SNR of at least 20), using the average SNR of
+  the last 3 scans for each, on two scans in a row. Averaging matters because
+  SNR wobbles by about 6 on its own. Only one such alert at a time: no new one until you've dismissed the
   last, and never the same network twice within an hour. WiFi Rank scans
   quietly every 5 minutes for this. Turn it off with **Better Network Alerts**
   in the right-click menu.
@@ -95,7 +102,7 @@ names on two access points shows as one group: "6 names · 2 access points".
 ## Reading the numbers
 
 - **SNR**: how far the signal stands out above background noise. The best single
-  guide to real speed, so everything is sorted by it. **Green** 25 and above is
+  guide to how clean the signal is (the ranking combines it with width). **Green** 25 and above is
   enough for full speed, **orange** 10–24 works but may slow, **red** under 10
   will struggle.
 - **Signal (dBm)**: raw strength, always negative; closer to zero is stronger.
